@@ -33,12 +33,22 @@ def check_ngrok():
 
 def start_mcp_server(public_url=""):
     print(f"Starting CamXposed MCP server on 127.0.0.1:{PORT} (transport=streamable-http)...")
-    cmd = [
-        sys.executable, str(BASE_DIR / "server.py"),
-        "--transport", "streamable-http",
-        "--host", "127.0.0.1",
-        "--port", str(PORT)
-    ]
+    # Check if uv is available and project has uv.lock; otherwise use direct Python interpreter
+    uv_bin = shutil.which("uv")
+    if uv_bin and (BASE_DIR / "uv.lock").exists() and (BASE_DIR / ".venv").exists():
+        cmd = [
+            uv_bin, "--directory", str(BASE_DIR), "run", "server.py",
+            "--transport", "streamable-http",
+            "--host", "127.0.0.1",
+            "--port", str(PORT)
+        ]
+    else:
+        cmd = [
+            sys.executable, str(BASE_DIR / "server.py"),
+            "--transport", "streamable-http",
+            "--host", "127.0.0.1",
+            "--port", str(PORT)
+        ]
     env = dict(os.environ)
     if public_url:
         env["CAMXPOSED_PUBLIC_URL"] = public_url
