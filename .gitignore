@@ -1,0 +1,41 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Configuration & secrets
+.env
+.env.*
+*.key
+*.pem
+*.token
+ngrok.yml
+
+# Logs & PID files
+*.log
+*.pid
+logs/
+chatgpt_tunnel.log
+chatgpt_tunnel.pid
+
+# Audio / Temporary dumps
+*.mp3
+*.wav
+*.pcm
+*.alaw
+temp/
+tmp/
+
+# Backups & archives
+*.bak
+*.zip
+*.tar.gz
+camxposed*.zip
