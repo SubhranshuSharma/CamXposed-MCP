@@ -45,19 +45,23 @@ python3 run_chatgpt_mcp.py
 
 ### Option B: Running on Android via Termux
 
-Termux runs natively on Android without root and communicates directly with cameras on the local Wi-Fi.
+Termux runs natively on Android and communicates directly with cameras on the local Wi-Fi.
 
-#### 1. Install Packages in Termux
+#### 1. Install Packages & Build Tools in Termux
 ```bash
 pkg update -y
-pkg install python python-pip ffmpeg rust binutils libxml2 libxslt git curl -y
+pkg install python python-pip ffmpeg rust binutils clang make pkg-config openssl git curl -y
 ```
 
 #### 2. Clone and Install Dependencies
+Termux uses Android's Bionic environment; set `ANDROID_API_LEVEL` to build native extensions cleanly:
 ```bash
-git clone https://github.com/SubhranshuSharma/camxposed-mcp.git
-cd camxposed-mcp
-pip install -r requirements.txt
+git clone https://github.com/SubhranshuSharma/CamXposed-MCP.git
+cd CamXposed-MCP
+
+export ANDROID_API_LEVEL=24
+export CARGO_BUILD_JOBS=2
+pip install --no-cache-dir -r requirements.txt
 ```
 
 #### 3. Install Ngrok (ARM64)
@@ -66,7 +70,7 @@ curl -s https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-arm64.tgz -o 
 tar -xvzf ngrok.tgz -C $PREFIX/bin/
 rm ngrok.tgz
 
-# Authenticate ngrok:
+# Authenticate ngrok once:
 ngrok config add-authtoken <YOUR_NGROK_AUTHTOKEN>
 ```
 
