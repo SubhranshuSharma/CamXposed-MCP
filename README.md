@@ -18,8 +18,8 @@ sudo apt update && sudo apt install -y ffmpeg python3 python3-pip
 
 #### 2. Install Dependencies
 ```bash
-git clone https://github.com/SubhranshuSharma/camxposed-mcp.git
-cd camxposed-mcp
+git clone https://github.com/SubhranshuSharma/CamXposed-MCP.git
+cd CamXposed-MCP
 pip install -r requirements.txt
 # Or using uv:
 # uv sync
