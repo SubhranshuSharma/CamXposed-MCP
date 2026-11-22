@@ -34,7 +34,7 @@ def check_ngrok():
 def start_mcp_server(public_url=""):
     print(f"Starting CamXposed MCP server on 127.0.0.1:{PORT} (transport=streamable-http)...")
     cmd = [
-        "uv", "--directory", str(BASE_DIR), "run", "server.py",
+        sys.executable, str(BASE_DIR / "server.py"),
         "--transport", "streamable-http",
         "--host", "127.0.0.1",
         "--port", str(PORT)
