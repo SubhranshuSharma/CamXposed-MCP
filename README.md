@@ -1,8 +1,100 @@
 # CamXposed MCP — Native LAN Camera Control, Vision & PTZ
 
-CamXposed MCP exposes local ONVIF/RTSP camera discovery, snapshots, PTZ, audio capture, and speaker playback as MCP tools. It is designed to run on Android through Termux and reach a remote MCP client through a stable ngrok domain.
+CamXposed MCP exposes local ONVIF/RTSP camera discovery, snapshots, PTZ, audio capture, and speaker playback as MCP tools. It can run on Linux or Android through Termux and reach a remote MCP client through ngrok.
 
-> **Important:** The MCP server and ngrok tunnel are two separate long-running processes. Start the Python MCP server first, then start the ngrok tunnel in a second Termux session. Keep both running.
+> **Important:** The MCP server and ngrok tunnel are two separate long-running processes. Start the Python MCP server first, then start the ngrok tunnel in a second terminal/session. Keep both running.
+
+## Linux deployment (Ubuntu / Debian)
+
+Run the server on a Linux machine connected to the same reachable LAN as the ONVIF camera. The MCP server and ngrok tunnel run in separate terminals.
+
+### 1. Install system dependencies
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip ffmpeg
+```
+
+Install the ngrok agent using the official instructions for your Linux distribution: https://ngrok.com/download. Then authenticate it with your own token:
+
+```bash
+ngrok config add-authtoken "YOUR_NGROK_AUTHTOKEN"
+```
+
+Do not commit the token or put it in the repository.
+
+### 2. Clone the repository
+
+```bash
+git clone https://github.com/SubhranshuSharma/CamXposed-MCP.git
+cd CamXposed-MCP
+```
+
+For an existing checkout, update the default branch:
+
+```bash
+cd ~/CamXposed-MCP
+git switch main
+git pull origin main
+```
+
+### 3. Create the Python environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4. Configure ONVIF credentials (optional)
+
+The default is username `admin` with an empty password. Override these environment variables if your camera uses different credentials:
+
+```bash
+export CAMXPOSED_ONVIF_USER="admin"
+export CAMXPOSED_ONVIF_PASS=""
+```
+
+Set these in the same terminal before starting the server.
+
+### 5. Start the MCP server — terminal 1
+
+```bash
+source .venv/bin/activate
+python server.py --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+Keep this process running. The local MCP endpoint is:
+
+```text
+http://127.0.0.1:8000/mcp
+```
+
+Bind to `127.0.0.1` when using ngrok; do not expose the unauthenticated MCP server directly to the LAN or public internet.
+
+### 6. Start ngrok — terminal 2
+
+For the reserved domain configured for this project:
+
+```bash
+ngrok http --url=your-subdomain.ngrok-free.app 8000
+```
+
+The remote MCP endpoint is:
+
+```text
+https://your-subdomain.ngrok-free.app/mcp
+```
+
+Configure the MCP client for **Streamable HTTP** using that URL. Keep both terminal processes running. The ngrok URL provides reachability, not application-level authorization; only share it with trusted clients.
+
+### 7. Linux troubleshooting
+
+- If the server cannot find FFmpeg, verify `ffmpeg -version` and that `ffmpeg` is on `PATH`.
+- If Python package installation fails, confirm the virtual environment is active and retry `pip install -r requirements.txt`.
+- If discovery returns no cameras, confirm the Linux host and camera are on the same reachable LAN/VLAN and that UDP multicast WS-Discovery traffic on port 3702 is not blocked.
+- Camera discovery uses LAN multicast; running the server on a remote VPS will not discover a camera behind your home router unless you provide a routed network path.
 
 ## Termux deployment (Android / ARM64)
 
@@ -12,7 +104,8 @@ These are the deployment commands used by the project maintainer. Run them in **
 
 ```bash
 cd ~/camxposed-mcp
-git pull origin fix/dynamic-onvif-discovery
+git switch main
+git pull origin main
 ```
 
 If this is a fresh installation, clone the repository first:
@@ -116,7 +209,7 @@ Discovery uses these credentials for ONVIF SOAP requests:
 - If only a username is configured: that username with an empty password.
 - If both are configured: use the supplied username and password.
 
-Configure credentials in the Termux shell **before starting the Python server**:
+Configure credentials in the Linux or Termux shell **before starting the Python server**:
 
 ```bash
 export CAMXPOSED_ONVIF_USER="admin"
