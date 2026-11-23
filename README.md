@@ -17,7 +17,7 @@ Install the small set of OS tools:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip ffmpeg
+sudo apt install -y python3 python3-pip ffmpeg nodejs npm
 ```
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended), then run:
@@ -32,7 +32,7 @@ Or use Python directly; the launcher installs missing Python requirements automa
 python3 run.py
 ```
 
-If ngrok CLI is installed and authenticated with `ngrok config add-authtoken YOUR_TOKEN`, the launcher reuses that configuration. Otherwise install ngrok or set `NGROK_AUTHTOKEN`; the Node SDK fallback is used when Node.js/npm are available.
+If ngrok CLI is installed and authenticated with `ngrok config add-authtoken YOUR_TOKEN`, the launcher reuses that configuration. Otherwise it automatically prepares the Node SDK and prompts for an ngrok token (or reads `NGROK_AUTHTOKEN`).
 
 ### Android (Termux — Play Store or F-Droid)
 
