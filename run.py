@@ -179,6 +179,27 @@ def ensure_termux_ngrok_sdk() -> tuple[str, dict[str, str]]:
     return node, env
 
 
+def child_parent_death_signal():
+    """Ask Linux/Android to terminate this child if the launcher dies abruptly."""
+    parent_pid = os.getpid()
+
+    def configure():
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            # PR_SET_PDEATHSIG: deliver SIGTERM when the creating launcher exits.
+            if libc.prctl(1, int(signal.SIGTERM), 0, 0, 0) != 0:
+                return
+            # Close the fork-to-prctl race: parent may have exited before setup.
+            if os.getppid() != parent_pid:
+                os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            # Normal finally/process-group cleanup remains the fallback.
+            pass
+
+    return configure
+
+
 def start_server(port: int):
     env = python_env()
     log = open(SERVER_LOG, "a", encoding="utf-8")
@@ -187,7 +208,7 @@ def start_server(port: int):
         "--transport", "streamable-http", "--host", HOST, "--port", str(port),
     ]
     proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-                            start_new_session=True)
+                            start_new_session=True, preexec_fn=child_parent_death_signal())
     return proc, log
 
 
