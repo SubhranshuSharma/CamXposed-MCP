@@ -101,19 +101,45 @@ def node_env() -> dict[str, str]:
     return env
 
 
-def get_ngrok_token() -> str:
+TOKEN_FILE = Path(os.getenv(
+    "CAMXPOSED_NGROK_TOKEN_FILE",
+    str(Path.home() / ".config" / "camxposed-mcp" / "ngrok_token"),
+))
+
+
+def get_ngrok_token(*, change: bool = False) -> str:
+    # Explicit environment value wins and is saved for subsequent launches.
     token = (os.getenv("NGROK_AUTHTOKEN") or os.getenv("NGROK_AUTH_TOKEN") or "").strip()
-    if token:
-        return token
-    if sys.stdin.isatty():
-        token = getpass.getpass("ngrok authtoken (input hidden): ").strip()
-        if token:
-            os.environ["NGROK_AUTHTOKEN"] = token
-            return token
-    raise RuntimeError(
-        "ngrok authentication is missing. Set NGROK_AUTHTOKEN, or run this in an "
-        "interactive terminal and enter your token when prompted."
-    )
+    if not token and not change:
+        try:
+            token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RuntimeError(f"Cannot read saved ngrok token at {TOKEN_FILE}: {error}") from error
+
+    if not token or change:
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "ngrok authentication is missing. Run interactively once to save it, "
+                "or set NGROK_AUTHTOKEN."
+            )
+        prompt = "Enter new ngrok authtoken (input hidden): " if change else "ngrok authtoken (input hidden): "
+        token = getpass.getpass(prompt).strip()
+        if not token:
+            raise RuntimeError("No ngrok authtoken entered.")
+
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(token + "\\n", encoding="utf-8")
+    try:
+        TOKEN_FILE.chmod(0o600)
+        TOKEN_FILE.parent.chmod(0o700)
+    except OSError:
+        # Android/Windows filesystems may not implement POSIX permission bits.
+        pass
+    os.environ["NGROK_AUTHTOKEN"] = token
+    say(f"✓ ngrok token saved securely at {TOKEN_FILE}")
+    return token
 
 
 def ensure_termux_ngrok_sdk() -> tuple[str, dict[str, str]]:
@@ -171,7 +197,8 @@ def wait_for_server(proc, timeout: float = 25.0) -> bool:
     return False
 
 
-def start_ngrok():
+def start_ngrok(*, change_token: bool = False):
+    token = get_ngrok_token(change=change_token)
     ngrok = shutil.which("ngrok")
 
     # Native ngrok CLI can reuse an existing `ngrok config add-authtoken`
@@ -182,6 +209,7 @@ def start_ngrok():
             command.append(f"--url=https://{DOMAIN}")
         log = open(TUNNEL_LOG, "a", encoding="utf-8")
         env = os.environ.copy()
+        env["NGROK_AUTHTOKEN"] = token
         proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
         time.sleep(1.5)
         if proc.poll() is not None:
@@ -189,7 +217,6 @@ def start_ngrok():
             raise RuntimeError(f"ngrok exited during startup; inspect {TUNNEL_LOG}")
         return proc, log, f"https://{DOMAIN}" if DOMAIN else ""
 
-    token = get_ngrok_token()
     node, env = ensure_termux_ngrok_sdk() if is_termux() else (shutil.which("node"), os.environ.copy())
     if not node:
         raise RuntimeError("Install ngrok CLI on Linux, or install Node.js to use the ngrok SDK fallback.")
@@ -285,6 +312,9 @@ def stop_process(proc) -> None:
 
 
 def main() -> int:
+    change_token = "--change-token" in sys.argv[1:]
+    if change_token:
+        sys.argv.remove("--change-token")
     if sys.version_info < (3, 10):
         raise RuntimeError("CamXposed MCP requires Python 3.10 or newer.")
     if not shutil.which("ffmpeg"):
@@ -304,7 +334,7 @@ def main() -> int:
         say("✓ Local MCP server is healthy")
 
         say("Connecting ngrok remote tunnel...")
-        tunnel_proc, tunnel_log, public_url = start_ngrok()
+        tunnel_proc, tunnel_log, public_url = start_ngrok(change_token=change_token)
         endpoint = public_url + "/mcp"
         say("Checking the public MCP endpoint...")
         if verify_remote_endpoint(endpoint):
