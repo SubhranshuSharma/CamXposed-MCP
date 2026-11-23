@@ -427,7 +427,7 @@ class Client:
                     return None, self.camera
                 # A previously selected native LAN camera may have moved to a new
                 # DHCP address. Never route its stale lan_<ip> ID through the gateway.
-                if self.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", self.camera):
+                if self.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", self.camera):
                     self.camera = None
                 else:
                     try:
@@ -1006,7 +1006,7 @@ def camera_discover():
     with client.lock:
         client.cached_cameras = []
         client.cached_cameras_time = 0.0
-        if client.camera and (client.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", client.camera)):
+        if client.camera and (client.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", client.camera)):
             with lan_engine.lock:
                 if client.camera not in lan_engine.discovered_cameras:
                     client.camera = None
@@ -1050,7 +1050,7 @@ def onvif_discover(timeout_seconds: float = 2.0):
     with client.lock:
         client.cached_cameras = []
         client.cached_cameras_time = 0.0
-        if client.camera and (client.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", client.camera)):
+        if client.camera and (client.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", client.camera)):
             with lan_engine.lock:
                 if client.camera not in lan_engine.discovered_cameras:
                     client.camera = None
