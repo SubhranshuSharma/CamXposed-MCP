@@ -2,24 +2,6 @@
 
 MCP server for ONVIF cameras: discovery, snapshots, PTZ, audio capture and speaker playback.
 
-
-## Dependencies and discovery
-
-Python dependencies are installed by `pip install -r requirements.txt`:
-
-- `mcp` — MCP server and Streamable HTTP transport.
-- `edge-tts` — text-to-speech for camera speaker playback.
-- `pydantic` — data validation used by the server.
-
-System dependencies:
-
-- `ffmpeg` — RTSP frame capture and camera audio capture/playback.
-- `git`, Python 3.10 or newer, and `pip`.
-
-**No separate WS-Discovery package is required.** WS-Discovery is implemented directly in `lan_engine.py` using Python's standard-library UDP sockets and XML support. SSDP discovery is also native; no `wsdiscovery`, `onvif-zeep`, or other discovery package needs to be installed. Allow LAN multicast/broadcast traffic, especially WS-Discovery UDP port `3702` (multicast `239.255.255.250`), through the host firewall and Wi-Fi network.
-
-On Termux, install the system dependencies with `pkg install` as shown below. Node.js and the Android ARM64 ngrok package are only needed for the bundled ngrok tunnel method.
-
 ## Linux (Ubuntu/Debian)
 
 Requirements: Python 3, Git, FFmpeg, and ngrok. The host must be on the camera's LAN.
