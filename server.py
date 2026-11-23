@@ -414,22 +414,27 @@ class Client:
             lan_cam = self.find_lan_camera(target)
             if lan_cam:
                 return None, lan_cam.id
-            # An explicit native LAN ID/IP may have changed after DHCP renewal.
-            # Refresh once before treating it as a bridge camera identifier.
-            if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", target):
+            # A remembered LAN ID/IP is only a hint; DHCP may have changed it.
+            if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", target):
                 try:
-                    lan_engine.discover_all(timeout=3.0)
-                    lan_cam = self.find_lan_camera(target)
-                    if lan_cam:
-                        return None, lan_cam.id
+                    lan_engine.discover_all(timeout=4.0)
+                    with lan_engine.lock:
+                        cameras = list(lan_engine.discovered_cameras.values())
+                    if not cameras:
+                        raise RuntimeError("Automatic ONVIF discovery returned zero cameras.")
+                    chosen = next((c for c in cameras if c.ip == target or c.id == target), cameras[0])
+                    with self.lock:
+                        self.camera = chosen.id
+                    logger.info("[resolve_camera] Refreshed stale LAN target %s -> %s", target, chosen.id)
+                    return None, chosen.id
                 except Exception as e:
                     logger.warning(f"[resolve_camera] Native LAN refresh failed: {e}")
+                    raise RuntimeError(f"Could not resolve camera target {target}; automatic ONVIF discovery failed: {e}") from e
             try:
                 g = self.gateway()
                 return g, target
             except Exception:
                 return None, target
-
         # Reuse a selected camera only while it is still present. If its DHCP
         # address changed, discard the stale ID and run a fresh LAN discovery.
         with self.lock:
@@ -1567,6 +1572,8 @@ def camera_speak(text:str, camera_id:Optional[str]=None, wait:bool=False, voice:
     """Broadcast spoken announcements, singing, or melodies out loud into the physical room through the camera speaker.
 
     CRITICAL USAGE INSTRUCTIONS:
+    - Camera selection and LAN/ONVIF discovery are automatic inside this tool. Never ask the user to run discovery tools or require a separate discovery call first.
+    - Omit camera_id unless the user explicitly identifies a particular camera; remembered camera IDs may be stale after DHCP changes.
     - ONLY call this tool when the user EXPLICITLY asks to broadcast, announce, speak, or sing THROUGH THE CAMERA (e.g. "tell whoever is in the room that dinner is ready", "announce via the camera", "sing a song through the camera speaker").
     - NEVER call this tool to respond to normal conversational queries, status updates, or to acknowledge commands. Your normal voice chat responses are already delivered directly to the user through your own conversation channel!
     - Do NOT narrate your actions through the camera (e.g., do NOT call camera_speak to say "I am checking the camera" or "Camera moved").
