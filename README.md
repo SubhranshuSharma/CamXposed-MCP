@@ -108,6 +108,23 @@ Configure the MCP client to use **Streamable HTTP** and this URL. The server doe
 
 ## Camera discovery, selection, and NVR filtering
 
+### ONVIF login defaults
+
+Discovery uses these credentials for ONVIF SOAP requests:
+
+- If no credentials are configured: username `admin`, password empty (`""`).
+- If only a username is configured: that username with an empty password.
+- If both are configured: use the supplied username and password.
+
+Configure credentials in the Termux shell **before starting the Python server**:
+
+```bash
+export CAMXPOSED_ONVIF_USER="admin"
+export CAMXPOSED_ONVIF_PASS=""
+```
+
+For the common default `admin` / blank-password camera, these exports are optional. The server does not brute-force passwords or cycle through guessed credentials. If authentication fails, provide the camera's actual credentials. Do not put passwords in the README, shell history, source code, or Git commits.
+
 ### Discovery is not the same as camera selection
 
 ONVIF WS-Discovery can return multiple devices on the LAN: cameras, NVRs/DVRs, and other ONVIF endpoints. A device answering WS-Discovery is not automatically a usable camera.
