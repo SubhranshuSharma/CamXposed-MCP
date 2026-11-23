@@ -303,8 +303,18 @@ class LanEngine:
             except Exception:
                 pass
 
-        # 3. GetProfiles
-        profile_token = "PROFILE_000"
+        # Recorder/NVR endpoints may answer WS-Discovery but are not usable
+        # room cameras. Exclude devices whose ONVIF identity explicitly says
+        # recorder/NVR/DVR before attempting media profile registration.
+        identity = " ".join((mfr, model, fw)).strip()
+        if re.search(r"\\b(?:nvr|dvr|recorder|network video recorder|digital video recorder)\\b", identity, re.IGNORECASE):
+            logger.info("[interrogate_onvif] Excluding recorder-class ONVIF device %s (%s)", ip, identity)
+            return None
+
+        # 3. GetProfiles. A valid media profile is required for a usable camera;
+        # merely answering WS-Discovery is not enough (NVRs and other ONVIF
+        # devices can advertise the same NetworkVideoTransmitter type).
+        profile_token = ""
         ptz_config_token = "PTZConfigurationToken"
         stream_uri = f"rtsp://{ip}:554/ch0_0.264"
         snapshot_url = f"http://{ip}:{port}/snapshot"
@@ -316,14 +326,18 @@ class LanEngine:
                 for p in root_prof.iter():
                     if p.tag.rsplit("}", 1)[-1] == "Profiles":
                         tok = p.attrib.get("token", "")
-                        if tok and profile_token == "PROFILE_000":
+                        if tok and not profile_token:
                             profile_token = tok
                     elif p.tag.rsplit("}", 1)[-1] == "PTZConfiguration":
                         cfg_tok = p.attrib.get("token", "")
                         if cfg_tok:
                             ptz_config_token = cfg_tok
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[interrogate_onvif] Invalid GetProfiles response from %s:%s: %s", ip, port, e)
+
+        if not profile_token:
+            logger.info("[interrogate_onvif] Excluding %s:%s: no usable ONVIF media profile (likely NVR/non-camera endpoint)", ip, port)
+            return None
 
         # GetSnapshotUri
         st_snap, snap_resp = self.onvif_soap(media_url, "http://www.onvif.org/ver10/media/wsdl/GetSnapshotUri",
