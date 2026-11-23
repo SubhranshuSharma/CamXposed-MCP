@@ -4,56 +4,39 @@ MCP server for ONVIF cameras: discovery, snapshots, PTZ, audio capture and speak
 
 ## One-command setup
 
-Clone once:
+Run this once on Linux or Android Termux (Play Store or F-Droid):
 
 ```bash
-git clone https://github.com/SubhranshuSharma/CamXposed-MCP.git
-cd CamXposed-MCP
+curl -fsSL https://raw.githubusercontent.com/SubhranshuSharma/CamXposed-MCP/main/install.sh | sh
 ```
 
-### Linux (Ubuntu/Debian)
+The installer:
+- Installs the required OS packages (Python, Git, FFmpeg, Node.js/npm).
+- Detects Termux versus Linux and supports Debian/Ubuntu, Fedora/RHEL, and Arch Linux.
+- Clones the repository to `~/camxposed-mcp`, or fast-forward updates that checkout if it is clean.
+- Does not overwrite a checkout containing local modifications. Set `CAMXPOSED_INSTALL_DIR` to choose another location.
 
-Install the small set of OS tools:
+After setup, start everything with one command:
 
+Linux:
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-pip ffmpeg nodejs npm
-```
-
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended), then run:
-
-```bash
-uv run run.py
-```
-
-Or use Python directly; the launcher installs missing Python requirements automatically:
-
-```bash
+cd ~/camxposed-mcp
 python3 run.py
 ```
 
-If ngrok CLI is installed and authenticated with `ngrok config add-authtoken YOUR_TOKEN`, the launcher reuses that configuration. Otherwise it automatically prepares the Node SDK and prompts for an ngrok token (or reads `NGROK_AUTHTOKEN`).
-
-### Android (Termux — Play Store or F-Droid)
-
-The launcher detects the active Termux prefix at runtime, so it does not assume the Play Store or F-Droid installation path.
-
+Termux:
 ```bash
-pkg update
-pkg install -y git python nodejs ffmpeg
-git clone https://github.com/SubhranshuSharma/CamXposed-MCP.git ~/camxposed-mcp
 cd ~/camxposed-mcp
-```
-
-On the first run, the launcher asks for your ngrok token once (hidden input) and saves it under `~/.config/camxposed-mcp/ngrok_token` with owner-only permissions. Future runs reuse it automatically. You do not need to export the token every time. Then launch:
-
-```bash
 python run.py
 ```
 
-The first run installs the Android ARM64 ngrok Node SDK in Termux's user cache. It also applies the Termux `libpython` preload automatically when the matching shared library exists. No manual `LD_PRELOAD`, separate server session, separate tunnel session, or global npm install is needed.
+The launcher installs missing Python packages and the ngrok Node SDK automatically. On Termux it also applies the matching `libpython` preload when available. The first launch asks for your ngrok token once (hidden input) and saves it under `~/.config/camxposed-mcp/ngrok_token`; later launches reuse it. No separate server or tunnel command, manual `LD_PRELOAD`, or global npm install is needed.
 
-You can also use `uv run run.py` if uv is installed and working in your Termux environment. Plain `python run.py` is the supported fallback.
+To change the saved token later:
+
+```bash
+python run.py --change-token
+```
 
 ## Configuration
 
