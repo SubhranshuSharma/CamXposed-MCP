@@ -21,7 +21,7 @@ from mcp.types import AudioContent, TextContent
 mcp = MCPServer(
     name="कैमXposed",
     title="कैमXposed",
-    description="CamXposed MCP Bridge - Smart IP Camera Control, Vision & PTZ. CAMERA CONTRACT: Camera-targeted tools are self-resolving: explicit camera_id wins; otherwise use the selected usable camera; if none is selected or the selection is stale, automatically rediscover and select the first validated camera. Never ask the user to run discovery or selection manually. Discovery filters NVR/DVR/recorder endpoints and requires a usable ONVIF media profile. Use camera_select only when the user explicitly chooses a camera.",
+    description="CamXposed MCP Bridge - Smart IP Camera Control, Vision & PTZ. CAMERA CONTRACT: Start with camera_list; it automatically performs a bounded LAN discovery when the inventory is empty or stale and selects the first usable camera if none is selected. Camera-targeted tools also self-resolve: explicit camera_id wins; otherwise use the selected usable camera, rediscovering if necessary. Never ask the user to run discovery or selection manually. Use camera_discover only for an explicit refresh or diagnostics, not as a prerequisite. Discovery filters NVR/DVR/recorder endpoints and requires a usable ONVIF media profile. Use camera_select only when the user explicitly chooses a camera.",
     version="1.0.0",
 )
 # Discovery uses native WS-Discovery over UDP 3702. No Avahi, zeroconf, or UPnP dependency.
@@ -1061,21 +1061,82 @@ CAMERA RESOLUTION: Discover camera devices only. NVR/DVR/recorder endpoints and 
 
 @mcp.tool()
 def camera_list():
-    """List available cameras (both native LAN ONVIF cameras and bridge-managed cameras). Default camera is automatically targeted by move/observe/speak.
+    """List available cameras (native LAN ONVIF and bridge-managed).
 
-CAMERA RESOLUTION: Returns usable cameras only; NVR/DVR/recorder endpoints are filtered during discovery."""
+    If the native inventory is empty or older than 30 seconds, this tool runs
+    one bounded LAN discovery automatically. It refreshes the combined list
+    and selects the first usable camera only when no valid selection exists.
+    Use camera_discover separately only for an explicit full refresh or
+    diagnostics; callers must not need to invoke it before listing cameras.
+    NVR/DVR/recorder endpoints and devices without usable media profiles are
+    excluded during discovery.
+    """
+    discovery = None
+    discovery_error = None
+    with lan_engine.lock:
+        native_count = len(lan_engine.discovered_cameras)
+        scan_age = time.time() - lan_engine.last_scan_time if lan_engine.last_scan_time else float("inf")
+
+    # Avoid spending several seconds on multicast discovery on every list call.
+    # Only scan when we have no usable inventory or the previous scan is stale.
+    if native_count == 0 or scan_age > 30.0:
+        try:
+            logger.info(
+                "[camera_list] Native inventory empty/stale (count=%s, age=%.1fs); running bounded discovery",
+                native_count, scan_age,
+            )
+            discovery = lan_engine.discover_all(timeout=1.0)
+            with client.lock:
+                client.cached_cameras = []
+                client.cached_cameras_time = 0.0
+                if client.camera and (
+                    client.camera.startswith("lan_")
+                    or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", client.camera)
+                ):
+                    with lan_engine.lock:
+                        if client.camera not in lan_engine.discovered_cameras:
+                            client.camera = None
+        except Exception as exc:
+            discovery_error = str(exc)
+            logger.warning("[camera_list] Automatic LAN discovery failed: %s", exc)
+
+    # Preserve bridge-managed cameras as well as native LAN cameras.
     g = None
     try:
         g = client.gateway()
-    except Exception:
-        pass
-    cs = client.cameras(g)
-    return {
+    except Exception as exc:
+        logger.info("[camera_list] CamXposed gateway unavailable during listing: %s", exc)
+
+    cs = client.cameras(g, force_refresh=discovery is not None or discovery_error is not None)
+
+    # Keep a valid user selection. If there is none (or it went stale), select
+    # the first validated camera so subsequent operations have a deterministic target.
+    selected_id = None
+    with client.lock:
+        available_ids = {c.id for c in cs}
+        if client.camera not in available_ids:
+            client.camera = cs[0].id if cs else None
+        selected_id = client.camera
+
+    result = {
         "ok": True,
         "gateway": gj(g) if g else None,
         "cameraCount": len(cs),
-        "cameras": [cj(c) for c in cs]
+        "selectedCameraId": selected_id,
+        "cameras": [cj(c) for c in cs],
     }
+    if discovery is not None:
+        result["automaticDiscovery"] = {
+            "attempted": True,
+            "scanDurationSec": discovery.get("scanDurationSec", 0.0),
+            "discoveredCamerasCount": discovery.get("discoveredCamerasCount", 0),
+            "protocolsUsed": discovery.get("protocolsUsed", []),
+        }
+    elif discovery_error:
+        result["automaticDiscovery"] = {"attempted": True, "error": discovery_error}
+    else:
+        result["automaticDiscovery"] = {"attempted": False, "reason": "recent inventory reused"}
+    return result
 
 @mcp.tool()
 def onvif_discover(timeout_seconds: float = 2.0):
