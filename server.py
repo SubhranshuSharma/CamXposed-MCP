@@ -288,8 +288,33 @@ class Client:
                 break
             time.sleep(0.25)
 
+        # WS-Discovery is not guaranteed to answer on every Android/Wi-Fi
+        # combination. The LAN engine also discovers the gateway through mDNS
+        # and SSDP; promote those advertisements to candidates and validate
+        # them against the live HTTP gateway API before selecting one.
+        candidates = {g.uuid: g for g in found}
+        with lan_engine.lock:
+            advertised = list(lan_engine.discovered_gateways.values())
+        for item in advertised:
+            host = str(item.get("host", "")).strip()
+            try:
+                port = int(item.get("port", 18766))
+            except (TypeError, ValueError):
+                continue
+            if not host or port <= 0:
+                continue
+            props = item.get("properties") or {}
+            uid = str(props.get("uuid") or item.get("uuid") or f"{host}:{port}")
+            candidates.setdefault(uid, Gateway(
+                uuid=uid,
+                host=host,
+                port=port,
+                name=str(props.get("camera") or props.get("brand") or "CamXposed"),
+                txt={str(k): str(v) for k, v in props.items()},
+            ))
+
         live=[]
-        for g in found:
+        for g in candidates.values():
             if self.live(g):
                 with self.lock: self.gateways[g.uuid]=g
                 live.append(g)
