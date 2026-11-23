@@ -364,7 +364,6 @@ class Client:
                         "ptz": lcam.ptz_supported,
                         "snapshot": bool(lcam.snapshot_url),
                         "stream": bool(lcam.stream_uri),
-                        "presets": len(lcam.presets),
                         "lanNative": True,
                         "ip": lcam.ip,
                         "manufacturer": lcam.manufacturer,
@@ -957,46 +956,6 @@ CAMERA RESOLUTION: Returns only validated native LAN cameras with usable media p
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", errors="replace")
 
-    def onvif_presets(self, camera_ip, action="list", preset_token=None, preset_name=None, username="admin", password="", profile_token="PROFILE_000", port=8888):
-        """Manage or execute ONVIF PTZ Presets (list, goto, set, remove)."""
-        endpoint = f"http://{camera_ip}:{port}/onvif/ptz_service"
-        op = (action or "list").strip().lower()
-        if op == "list":
-            status, resp = self.onvif_soap(endpoint, "http://www.onvif.org/ver20/ptz/wsdl/GetPresets", f"<tptz:GetPresets><tptz:ProfileToken>{profile_token}</tptz:ProfileToken></tptz:GetPresets>", username, password)
-            if status >= 300: raise RuntimeError(f"GetPresets HTTP {status}: {resp[:300]}")
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(resp)
-            presets = []
-            for p in root.iter():
-                if p.tag.endswith("Preset"):
-                    token = p.attrib.get("token", "")
-                    name = ""
-                    for c in p:
-                        if c.tag.endswith("Name"): name = c.text or ""
-                    if token: presets.append({"token": token, "name": name or token})
-            return {"ok": True, "action": "list", "cameraIp": camera_ip, "profileToken": profile_token, "count": len(presets), "presets": presets}
-        elif op == "goto":
-            if not preset_token: raise ValueError("preset_token is required for 'goto' action")
-            status, resp = self.onvif_soap(endpoint, "http://www.onvif.org/ver20/ptz/wsdl/GotoPreset", f"<tptz:GotoPreset><tptz:ProfileToken>{profile_token}</tptz:ProfileToken><tptz:PresetToken>{preset_token}</tptz:PresetToken></tptz:GotoPreset>", username, password)
-            if status >= 300: raise RuntimeError(f"GotoPreset HTTP {status}: {resp[:300]}")
-            return {"ok": True, "action": "goto", "cameraIp": camera_ip, "presetToken": preset_token, "status": "Preset movement dispatched"}
-        elif op == "set":
-            if not preset_name: raise ValueError("preset_name is required for 'set' action")
-            status, resp = self.onvif_soap(endpoint, "http://www.onvif.org/ver20/ptz/wsdl/SetPreset", f"<tptz:SetPreset><tptz:ProfileToken>{profile_token}</tptz:ProfileToken><tptz:PresetName>{preset_name}</tptz:PresetName></tptz:SetPreset>", username, password)
-            if status >= 300: raise RuntimeError(f"SetPreset HTTP {status}: {resp[:300]}")
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(resp)
-            created_token = ""
-            for p in root.iter():
-                if p.tag.endswith("PresetToken"): created_token = p.text or ""
-            return {"ok": True, "action": "set", "cameraIp": camera_ip, "presetToken": created_token, "name": preset_name}
-        elif op == "remove":
-            if not preset_token: raise ValueError("preset_token is required for 'remove' action")
-            status, resp = self.onvif_soap(endpoint, "http://www.onvif.org/ver20/ptz/wsdl/RemovePreset", f"<tptz:RemovePreset><tptz:ProfileToken>{profile_token}</tptz:ProfileToken><tptz:PresetToken>{preset_token}</tptz:PresetToken></tptz:RemovePreset>", username, password)
-            if status >= 300: raise RuntimeError(f"RemovePreset HTTP {status}: {resp[:300]}")
-            return {"ok": True, "action": "remove", "cameraIp": camera_ip, "presetToken": preset_token}
-        else:
-            raise ValueError("action must be 'list', 'goto', 'set', or 'remove'")
 
 client=Client()
 def gj(g):return {"uuid":g.uuid,"host":g.host,"port":g.port,"name":g.name,"service":SERVICE_TYPE,"txt":g.txt,"gateway":g.gateway}
@@ -1171,8 +1130,6 @@ def onvif_cameras():
                 "snapshotUrl": c.snapshot_url,
                 "streamUri": c.stream_uri,
                 "ptzSupported": c.ptz_supported,
-                "presetCount": len(c.presets),
-                "presets": c.presets,
                 "manufacturer": c.manufacturer,
                 "model": c.model,
                 "firmware": c.firmware,
@@ -1205,60 +1162,9 @@ def onvif_inspect(ip_address: str, device_service_url: Optional[str] = None, use
                 "manufacturer": cam.manufacturer,
                 "model": cam.model,
                 "firmware": cam.firmware,
-                "presetCount": len(cam.presets),
-                "presets": cam.presets
             }
         }
     return {"ok": False, "error": f"Failed to interrogate ONVIF camera at {ip_address}"}
-
-def camera_presets(camera_id: Optional[str] = None, action: str = "list", preset_token: Optional[str] = None, name: Optional[str] = None, username: Optional[str] = "admin", password: Optional[str] = ""):
-    """Manage and navigate PTZ presets on an ONVIF-capable camera.
-    
-    Parameters:
-    - camera_id: Target camera ID, e.g. "lan_10_64_137_213" or canonical UID or IP address. If omitted, uses default camera.
-    - action: "list" (enumerate presets), "goto" (move to preset_token), "set" (save current position as preset with name), or "remove" (delete preset_token).
-    - preset_token: Token of the preset (e.g. "PRESET_1"), required for "goto" and "remove".
-    - name: Friendly name when setting a preset (e.g. "Door", "Desk"), required for "set".
-    
-
-CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
-    g, cid = client.resolve_camera(camera_id)
-    ip = None
-    if cid.startswith("lan_"):
-        ip = cid[4:].replace("_", ".")
-    elif re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", cid):
-        ip = cid
-    else:
-        lan_cam = client.find_lan_camera(cid)
-        if lan_cam:
-            ip = lan_cam.ip
-        elif g:
-            try:
-                cs = client.onvif_cameras(g)
-                for c in cs.get("cameras", []):
-                    if c.get("cameraId") == cid and c.get("ipAddress"):
-                        ip = c["ipAddress"]
-                        break
-            except Exception:
-                pass
-    if not ip:
-        raise RuntimeError(
-            f"Selected camera {cid} has no native ONVIF address; refusing to use a hardcoded/stale camera IP."
-        )
-
-    lan_cam = client.find_lan_camera(cid)
-    profile_token = lan_cam.profile_token if lan_cam else "PROFILE_000"
-    port = lan_cam.port if lan_cam else 8888
-    return client.onvif_presets(
-        camera_ip=ip,
-        action=action,
-        preset_token=preset_token,
-        preset_name=name,
-        username=(lan_cam.username if lan_cam else username) or "admin",
-        password=(lan_cam.password if lan_cam else password) or "",
-        profile_token=profile_token or "PROFILE_000",
-        port=port,
-    )
 
 def camera_ptz_capabilities(camera_id: Optional[str] = None):
     """Read the selected ONVIF camera's advertised PTZ capabilities, including velocity ranges, speed spaces, translation spaces, position spaces, and timeout range.
@@ -1365,7 +1271,6 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
                 "ip": lan_cam.ip,
                 "online": True,
                 "ptzSupported": lan_cam.ptz_supported,
-                "presetCount": len(lan_cam.presets),
                 "snapshotUrl": lan_cam.snapshot_url,
                 "streamUri": lan_cam.stream_uri
             }
@@ -1587,8 +1492,6 @@ def camera_ptz(
     x: float = 0.0,
     y: float = 0.0,
     zoom: float = 0.0,
-    preset_token: Optional[str] = None,
-    name: Optional[str] = None,
 ):
     """Unified local-first PTZ control.
 
@@ -1597,7 +1500,6 @@ def camera_ptz(
     - relative_move: finite normalized movement; x/y/zoom range -1.0..1.0.
     - status: current position and IDLE/MOVING state.
     - capabilities: advertised PTZ ranges and supported spaces.
-    - presets_list, preset_goto, preset_set, preset_remove: manage camera presets.
 
     Uses the native LAN ONVIF camera directly whenever available. The Android
     bridge is only a fallback for bridge-managed cameras. Camera selection and
@@ -1612,22 +1514,8 @@ def camera_ptz(
         return camera_ptz_status(camera_id)
     if op == "capabilities":
         return camera_ptz_capabilities(camera_id)
-    if op in {"presets_list", "preset_goto", "preset_set", "preset_remove"}:
-        preset_action = {
-            "presets_list": "list",
-            "preset_goto": "goto",
-            "preset_set": "set",
-            "preset_remove": "remove",
-        }[op]
-        return camera_presets(
-            camera_id=camera_id,
-            action=preset_action,
-            preset_token=preset_token,
-            name=name,
-        )
     raise ValueError(
         "action must be move, relative_move, status, capabilities, "
-        "presets_list, preset_goto, preset_set, or preset_remove"
     )
 
 
