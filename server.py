@@ -415,7 +415,7 @@ class Client:
             if lan_cam:
                 return None, lan_cam.id
             # A remembered LAN ID/IP is only a hint; DHCP may have changed it.
-            if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", target):
+            if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", target):
                 try:
                     lan_engine.discover_all(timeout=4.0)
                     with lan_engine.lock:
