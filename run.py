@@ -358,6 +358,13 @@ def main() -> int:
     platform_name = "Termux" if is_termux() else "Linux"
     say(f"CamXposed MCP launcher — {platform_name}")
     lock_handle = acquire_instance_lock()
+
+    # Convert SIGTERM into normal Python unwinding so finally always cleans
+    # up the server and tunnel process groups. SIGINT already raises this.
+    def handle_sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
     ensure_python_dependencies()
 
     server_proc = tunnel_proc = None
