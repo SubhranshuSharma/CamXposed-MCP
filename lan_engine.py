@@ -228,7 +228,6 @@ class LanEngine:
         finally:
             sock.close()
         return results
-
     def probe_mdns(self, timeout: float = 1.5) -> list[dict[str, Any]]:
         """Active mDNS browse for _camxposed._tcp.local. and _onvif._tcp.local."""
         results = []
@@ -458,12 +457,18 @@ class LanEngine:
         # Drop cameras from previous scans so DHCP changes cannot leave stale IPs selectable.
         with self.lock:
             self.discovered_cameras.clear()
+        # Use explicitly configured ONVIF credentials when supplied. If the user
+        # has not supplied credentials, default to the common camera login
+        # admin with an empty password. Supplying only a username also keeps
+        # the password empty; never invent or brute-force passwords.
+        onvif_username = os.getenv("CAMXPOSED_ONVIF_USER", "admin").strip() or "admin"
+        onvif_password = os.getenv("CAMXPOSED_ONVIF_PASS", "")
 
         # Interrogate only endpoints advertised by this live discovery pass.
         interrogated = []
         for ip, port in discovered_ips:
             try:
-                cam = self.interrogate_onvif(ip, port)
+                cam = self.interrogate_onvif(ip, port, onvif_username, onvif_password)
                 if cam:
                     interrogated.append(cam)
             except Exception as e:
@@ -687,8 +692,7 @@ class LanEngine:
         """Cancels any pending auto-stop timer and optionally sends a hardware ONVIF Stop."""
         with self.lock:
             state = self.ptz_move_states.get(cam.ip)
-            if not state:
-                return
+            if not state:                return
             state["generation"] += 1
             timer = state.get("timer")
             if timer:
