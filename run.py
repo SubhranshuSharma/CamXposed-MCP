@@ -9,6 +9,7 @@ import os
 import platform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PORT = int(os.getenv("CAMXPOSED_PORT", "8000"))
+PREFERRED_PORT = int(os.getenv("CAMXPOSED_PORT", "8000"))
+PORT_SCAN_COUNT = max(1, int(os.getenv("CAMXPOSED_PORT_SCAN_COUNT", "11")))
 HOST = "127.0.0.1"
 DOMAIN = os.getenv("CAMXPOSED_STATIC_DOMAIN", "crepe-cassette-engaged.ngrok-free.dev").strip()
 LOG_DIR = Path(os.getenv("CAMXPOSED_LOG_DIR", str(Path(tempfile.gettempdir()) / "camxposed-mcp")))
@@ -177,19 +179,20 @@ def ensure_termux_ngrok_sdk() -> tuple[str, dict[str, str]]:
     return node, env
 
 
-def start_server():
+def start_server(port: int):
     env = python_env()
     log = open(SERVER_LOG, "a", encoding="utf-8")
     command = [
         sys.executable, str(ROOT / "server.py"),
-        "--transport", "streamable-http", "--host", HOST, "--port", str(PORT),
+        "--transport", "streamable-http", "--host", HOST, "--port", str(port),
     ]
-    proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
     return proc, log
 
 
-def wait_for_server(proc, timeout: float = 25.0) -> bool:
-    url = f"http://{HOST}:{PORT}/mcp"
+def wait_for_server(proc, port: int, timeout: float = 25.0) -> bool:
+    url = f"http://{HOST}:{port}/mcp"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -207,20 +210,21 @@ def wait_for_server(proc, timeout: float = 25.0) -> bool:
     return False
 
 
-def start_ngrok(*, change_token: bool = False):
+def start_ngrok(port: int, *, change_token: bool = False):
     token = get_ngrok_token(change=change_token)
     ngrok = shutil.which("ngrok")
 
     # Native ngrok CLI can reuse an existing `ngrok config add-authtoken`
     # configuration, so do not force a second token prompt on desktop Linux.
     if ngrok and not is_termux():
-        command = [ngrok, "http", str(PORT)]
+        command = [ngrok, "http", str(port)]
         if DOMAIN:
             command.append(f"--url=https://{DOMAIN}")
         log = open(TUNNEL_LOG, "a", encoding="utf-8")
         env = os.environ.copy()
         env["NGROK_AUTHTOKEN"] = token
-        proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
         time.sleep(1.5)
         if proc.poll() is not None:
             log.close()
@@ -243,16 +247,18 @@ def start_ngrok(*, change_token: bool = False):
     env["NGROK_AUTHTOKEN"] = token
     js = (
         'const ngrok=require("@ngrok/ngrok");'
-        '(async()=>{const opts={addr:"127.0.0.1:' + str(PORT) + '",authtoken_from_env:true'
+        '(async()=>{const opts={addr:"127.0.0.1:' + str(port) + '",authtoken_from_env:true'
         + (',domain:' + repr(DOMAIN) if DOMAIN else '')
         + '};const listener=await ngrok.forward(opts);'
         'console.log("CAMXPOSED_TUNNEL_URL="+listener.url());'
         'setInterval(()=>{},60000);})().catch(e=>{console.error(e);process.exit(1)});'
-        'process.on("SIGINT",async()=>{await ngrok.disconnect();process.exit(0)});'
+        'const shutdown=async()=>{try{await ngrok.disconnect()}finally{process.exit(0)}};'
+        'process.on("SIGINT",shutdown);process.on("SIGTERM",shutdown);'
     )
     log = open(TUNNEL_LOG, "a", encoding="utf-8")
     proc = subprocess.Popen([node, "-e", js], cwd=ROOT, env=env,
-                            stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
+                            stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1,
+                            start_new_session=True)
     # SDK emits the public URL as soon as the tunnel is established.
     import selectors
     selector = selectors.DefaultSelector()
@@ -311,14 +317,33 @@ def verify_remote_endpoint(endpoint: str, attempts: int = 12) -> bool:
 
 
 def stop_process(proc) -> None:
-    if not proc or proc.poll() is not None:
+    """Stop the complete child process group, then reap the direct child."""
+    if not proc:
         return
-    proc.terminate()
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     try:
         proc.wait(timeout=8)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         proc.wait(timeout=3)
+
+
+def acquire_instance_lock():
+    """Prevent two launchers from managing competing server/tunnel pairs."""
+    import fcntl
+    handle = open(LOG_DIR / "launcher.lock", "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError("Another CamXposed MCP launcher is already running.")
+    return handle
 
 
 def main() -> int:
@@ -332,19 +357,37 @@ def main() -> int:
 
     platform_name = "Termux" if is_termux() else "Linux"
     say(f"CamXposed MCP launcher — {platform_name}")
+    lock_handle = acquire_instance_lock()
     ensure_python_dependencies()
 
     server_proc = tunnel_proc = None
     server_log = tunnel_log = None
     try:
-        say(f"Starting local MCP server at http://{HOST}:{PORT}/mcp ...")
-        server_proc, server_log = start_server()
-        if not wait_for_server(server_proc):
-            raise RuntimeError(f"MCP server did not become ready. Check {SERVER_LOG}")
-        say("✓ Local MCP server is healthy")
+        port = None
+        for candidate in range(PREFERRED_PORT, PREFERRED_PORT + PORT_SCAN_COUNT):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind((HOST, candidate))
+            except OSError:
+                continue
+            finally:
+                probe.close()
+            say(f"Starting local MCP server at http://{HOST}:{candidate}/mcp ...")
+            server_proc, server_log = start_server(candidate)
+            if wait_for_server(server_proc, candidate):
+                port = candidate
+                break
+            stop_process(server_proc)
+            server_proc = None
+        if port is None:
+            raise RuntimeError(
+                f"No available MCP port in {PREFERRED_PORT}-{PREFERRED_PORT + PORT_SCAN_COUNT - 1}. "
+                f"Check {SERVER_LOG}"
+            )
+        say(f"✓ Local MCP server is healthy on port {port}")
 
         say("Connecting ngrok remote tunnel...")
-        tunnel_proc, tunnel_log, public_url = start_ngrok(change_token=change_token)
+        tunnel_proc, tunnel_log, public_url = start_ngrok(port, change_token=change_token)
         endpoint = public_url + "/mcp"
         say("Checking the public MCP endpoint...")
         if verify_remote_endpoint(endpoint):
@@ -354,7 +397,7 @@ def main() -> int:
         say("")
         say("CAMXPOSED MCP IS READY")
         say(f"Remote MCP endpoint: {endpoint}")
-        say(f"Local endpoint:      http://{HOST}:{PORT}/mcp")
+        say(f"Local endpoint:      http://{HOST}:{port}/mcp")
         say(f"Server log:          {SERVER_LOG}")
         say(f"Tunnel log:          {TUNNEL_LOG}")
         say("Keep this process running. Press Ctrl+C to stop both services.")
@@ -375,6 +418,7 @@ def main() -> int:
             tunnel_log.close()
         if server_log:
             server_log.close()
+        lock_handle.close()
 
 
 if __name__ == "__main__":
