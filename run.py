@@ -130,7 +130,7 @@ def get_ngrok_token(*, change: bool = False) -> str:
             raise RuntimeError("No ngrok authtoken entered.")
 
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(token + "\\n", encoding="utf-8")
+    TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
     try:
         TOKEN_FILE.chmod(0o600)
         TOKEN_FILE.parent.chmod(0o700)
