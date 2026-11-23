@@ -79,27 +79,6 @@ class LanEngine:
         self.discovered_gateways: dict[str, dict[str, Any]] = {}
         self.ptz_move_states: dict[str, dict[str, Any]] = {}
         self.last_scan_time: float = 0.0
-        self._load_cached_inventory()
-
-    def _load_cached_inventory(self):
-        default_ip = os.getenv("CAMXPOSED_DEFAULT_ONVIF_IP", "10.64.137.213").strip()
-        if default_ip:
-            cid = f"lan_{default_ip.replace('.', '_')}"
-            self.discovered_cameras[cid] = LanCamera(
-                id=cid,
-                ip=default_ip,
-                name=f"ONVIF Camera ({default_ip})",
-                port=8888,
-                device_service_url=f"http://{default_ip}:8888/onvif/device_service",
-                media_service_url=f"http://{default_ip}:8888/onvif/media",
-                ptz_service_url=f"http://{default_ip}:8888/onvif/ptz_service",
-                snapshot_url=f"http://{default_ip}:8888/snapshot",
-                stream_uri=f"rtsp://{default_ip}:554/ch0_0.264",
-                username=os.getenv("CAMXPOSED_ONVIF_USER", "admin"),
-                password=os.getenv("CAMXPOSED_ONVIF_PASS", ""),
-                profile_token="PROFILE_000",
-                last_seen=time.time(),
-            )
 
     def onvif_soap(self, endpoint: str, action: str, body_xml: str, username: str = "admin", password: str = "", timeout: float = 5.0) -> tuple[int, str]:
         """Direct lightweight ONVIF SOAP caller with WS-Security UsernameToken Digest/Text support."""
@@ -415,12 +394,12 @@ class LanEngine:
                     else:
                         discovered_ips.add((addr, port))
 
-        # Always include the known local ONVIF camera IP if available
-        default_ip = os.getenv("CAMXPOSED_DEFAULT_ONVIF_IP", "10.64.137.213").strip()
-        if default_ip:
-            discovered_ips.add((default_ip, 8888))
+        # A discovery result is a fresh snapshot, not an append-only cache.
+        # Drop cameras from previous scans so DHCP changes cannot leave stale IPs selectable.
+        with self.lock:
+            self.discovered_cameras.clear()
 
-        # Interrogate discovered ONVIF IPs
+        # Interrogate only endpoints advertised by this live discovery pass.
         interrogated = []
         for ip, port in discovered_ips:
             try:
