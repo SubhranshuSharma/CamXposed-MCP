@@ -79,27 +79,6 @@ class LanEngine:
         self.discovered_gateways: dict[str, dict[str, Any]] = {}
         self.ptz_move_states: dict[str, dict[str, Any]] = {}
         self.last_scan_time: float = 0.0
-        self._load_cached_inventory()
-
-    def _load_cached_inventory(self):
-        default_ip = os.getenv("CAMXPOSED_DEFAULT_ONVIF_IP", "10.64.137.213").strip()
-        if default_ip:
-            cid = f"lan_{default_ip.replace('.', '_')}"
-            self.discovered_cameras[cid] = LanCamera(
-                id=cid,
-                ip=default_ip,
-                name=f"ONVIF Camera ({default_ip})",
-                port=8888,
-                device_service_url=f"http://{default_ip}:8888/onvif/device_service",
-                media_service_url=f"http://{default_ip}:8888/onvif/media",
-                ptz_service_url=f"http://{default_ip}:8888/onvif/ptz_service",
-                snapshot_url=f"http://{default_ip}:8888/snapshot",
-                stream_uri=f"rtsp://{default_ip}:554/ch0_0.264",
-                username=os.getenv("CAMXPOSED_ONVIF_USER", "admin"),
-                password=os.getenv("CAMXPOSED_ONVIF_PASS", ""),
-                profile_token="PROFILE_000",
-                last_seen=time.time(),
-            )
 
     def onvif_soap(self, endpoint: str, action: str, body_xml: str, username: str = "admin", password: str = "", timeout: float = 5.0) -> tuple[int, str]:
         """Direct lightweight ONVIF SOAP caller with WS-Security UsernameToken Digest/Text support."""
@@ -140,31 +119,77 @@ class LanEngine:
             return 0, str(e)
 
     def probe_ws_discovery(self, timeout: float = 2.0) -> list[dict[str, Any]]:
-        """Active WS-Discovery Probe for NetworkVideoTransmitter over UDP 3702."""
-        found = []
+        """Perform ONVIF WS-Discovery using the Python standard library.
+
+        This deliberately avoids wsdiscovery's platform-specific multicast
+        socket behavior, which is unreliable on Android/Termux.
+        """
+        message_id = f"urn:uuid:{uuid.uuid4()}"
+        probe = f'''<?xml version="1.0" encoding="UTF-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
+ xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+ <e:Header>
+  <w:MessageID>{message_id}</w:MessageID>
+  <w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>
+  <w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
+ </e:Header>
+ <e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body>
+</e:Envelope>'''.encode("utf-8")
+
+        found: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         try:
-            from wsdiscovery import WSDiscovery
-            wsd = WSDiscovery()
-            wsd.start()
-            services = wsd.searchServices(timeout=int(timeout))
-            for s in services:
-                epr = s.getEPR() or ""
-                xaddrs = s.getXAddrs() or []
-                types = [str(t) for t in (s.getTypes() or [])]
-                scopes = [str(sc) for sc in (s.getScopes() or [])]
-                is_onvif = any("networkvideotransmitter" in t.lower() or "device" in t.lower() for t in types) or any("onvif" in x.lower() for x in xaddrs)
-                found.append({
-                    "epr": epr,
-                    "xaddrs": xaddrs,
-                    "types": types,
-                    "scopes": scopes,
-                    "isOnvif": is_onvif,
-                    "source": "ws-discovery-lib"
-                })
-            wsd.stop()
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", 0))
+            sock.settimeout(0.25)
+            sock.sendto(probe, WS_DISCOVERY_ADDR)
+            deadline = time.monotonic() + max(0.5, float(timeout))
+            while time.monotonic() < deadline:
+                try:
+                    data, addr = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                try:
+                    root = ET.fromstring(data)
+                    xaddrs = []
+                    types = []
+                    scopes = []
+                    epr = ""
+                    for node in root.iter():
+                        tag = node.tag.rsplit("}", 1)[-1]
+                        value = (node.text or "").strip()
+                        if tag == "XAddrs" and value:
+                            xaddrs.extend(value.split())
+                        elif tag == "Types" and value:
+                            types.extend(value.split())
+                        elif tag == "Scopes" and value:
+                            scopes.extend(value.split())
+                        elif tag == "Address" and value and value.startswith("urn:"):
+                            epr = value
+                    if not xaddrs:
+                        continue
+                    key = (addr[0], tuple(sorted(xaddrs)))
+                    found[key] = {
+                        "epr": epr,
+                        "xaddrs": xaddrs,
+                        "types": types,
+                        "scopes": scopes,
+                        "isOnvif": True,
+                        "source": "ws-discovery-udp",
+                        "sourceIp": addr[0],
+                    }
+                except ET.ParseError:
+                    logger.debug("[probe_ws_discovery] Ignoring non-XML UDP response from %s", addr[0])
         except Exception as e:
-            logger.warning(f"[probe_ws_discovery] Exception: {e}")
-        return found
+            logger.warning(f"[probe_ws_discovery] Native UDP probe failed: {e}")
+        finally:
+            sock.close()
+        results = list(found.values())
+        logger.info("[probe_ws_discovery] Native UDP discovery received %d ONVIF response(s)", len(results))
+        return results
 
     def probe_ssdp(self, timeout: float = 1.5) -> list[dict[str, Any]]:
         """Active UPnP SSDP M-SEARCH over UDP 1900."""
@@ -203,7 +228,6 @@ class LanEngine:
         finally:
             sock.close()
         return results
-
     def probe_mdns(self, timeout: float = 1.5) -> list[dict[str, Any]]:
         """Active mDNS browse for _camxposed._tcp.local. and _onvif._tcp.local."""
         results = []
@@ -278,8 +302,18 @@ class LanEngine:
             except Exception:
                 pass
 
-        # 3. GetProfiles
-        profile_token = "PROFILE_000"
+        # Recorder/NVR endpoints may answer WS-Discovery but are not usable
+        # room cameras. Exclude devices whose ONVIF identity explicitly says
+        # recorder/NVR/DVR before attempting media profile registration.
+        identity = " ".join((mfr, model, fw)).strip()
+        if re.search(r"\b(?:nvr|dvr|recorder|network video recorder|digital video recorder)\b", identity, re.IGNORECASE):
+            logger.info("[interrogate_onvif] Excluding recorder-class ONVIF device %s (%s)", ip, identity)
+            return None
+
+        # 3. GetProfiles. A valid media profile is required for a usable camera;
+        # merely answering WS-Discovery is not enough (NVRs and other ONVIF
+        # devices can advertise the same NetworkVideoTransmitter type).
+        profile_token = ""
         ptz_config_token = "PTZConfigurationToken"
         stream_uri = f"rtsp://{ip}:554/ch0_0.264"
         snapshot_url = f"http://{ip}:{port}/snapshot"
@@ -291,14 +325,18 @@ class LanEngine:
                 for p in root_prof.iter():
                     if p.tag.rsplit("}", 1)[-1] == "Profiles":
                         tok = p.attrib.get("token", "")
-                        if tok and profile_token == "PROFILE_000":
+                        if tok and not profile_token:
                             profile_token = tok
                     elif p.tag.rsplit("}", 1)[-1] == "PTZConfiguration":
                         cfg_tok = p.attrib.get("token", "")
                         if cfg_tok:
                             ptz_config_token = cfg_tok
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[interrogate_onvif] Invalid GetProfiles response from %s:%s: %s", ip, port, e)
+
+        if not profile_token:
+            logger.info("[interrogate_onvif] Excluding %s:%s: no usable ONVIF media profile (likely NVR/non-camera endpoint)", ip, port)
+            return None
 
         # GetSnapshotUri
         st_snap, snap_resp = self.onvif_soap(media_url, "http://www.onvif.org/ver10/media/wsdl/GetSnapshotUri",
@@ -415,16 +453,22 @@ class LanEngine:
                     else:
                         discovered_ips.add((addr, port))
 
-        # Always include the known local ONVIF camera IP if available
-        default_ip = os.getenv("CAMXPOSED_DEFAULT_ONVIF_IP", "10.64.137.213").strip()
-        if default_ip:
-            discovered_ips.add((default_ip, 8888))
+        # A discovery result is a fresh snapshot, not an append-only cache.
+        # Drop cameras from previous scans so DHCP changes cannot leave stale IPs selectable.
+        with self.lock:
+            self.discovered_cameras.clear()
+        # Use explicitly configured ONVIF credentials when supplied. If the user
+        # has not supplied credentials, default to the common camera login
+        # admin with an empty password. Supplying only a username also keeps
+        # the password empty; never invent or brute-force passwords.
+        onvif_username = os.getenv("CAMXPOSED_ONVIF_USER", "admin").strip() or "admin"
+        onvif_password = os.getenv("CAMXPOSED_ONVIF_PASS", "")
 
-        # Interrogate discovered ONVIF IPs
+        # Interrogate only endpoints advertised by this live discovery pass.
         interrogated = []
         for ip, port in discovered_ips:
             try:
-                cam = self.interrogate_onvif(ip, port)
+                cam = self.interrogate_onvif(ip, port, onvif_username, onvif_password)
                 if cam:
                     interrogated.append(cam)
             except Exception as e:
@@ -648,8 +692,7 @@ class LanEngine:
         """Cancels any pending auto-stop timer and optionally sends a hardware ONVIF Stop."""
         with self.lock:
             state = self.ptz_move_states.get(cam.ip)
-            if not state:
-                return
+            if not state:                return
             state["generation"] += 1
             timer = state.get("timer")
             if timer:
