@@ -1142,7 +1142,7 @@ def onvif_cameras():
 def onvif_inspect(ip_address: str, device_service_url: Optional[str] = None, username: Optional[str] = "admin", password: Optional[str] = ""):
     """Interrogate an ONVIF camera at the given IP natively via ONVIF SOAP.
     
-    Enumerates ONVIF capabilities, device information, PTZ services, presets, and media profiles (RTSP stream and JPEG snapshot URIs).
+    Enumerates ONVIF capabilities, device information, PTZ services, and media profiles (RTSP stream and JPEG snapshot URIs).
     """
     cam = lan_engine.interrogate_onvif(str(ip_address).strip(), username=username or "admin", password=password or "")
     if cam:
@@ -1515,7 +1515,7 @@ def camera_ptz(
     if op == "capabilities":
         return camera_ptz_capabilities(camera_id)
     raise ValueError(
-        "action must be move, relative_move, status, capabilities, "
+        "action must be move, relative_move, status, or capabilities"
     )
 
 
