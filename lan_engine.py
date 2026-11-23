@@ -8,7 +8,7 @@ Supports:
      - mDNS / DNS-SD (_camxposed._tcp.local. and _onvif._tcp.local.)
   2. Native ONVIF camera control & media:
      - Direct HTTP Digest snapshot capture (/snapshot or GetSnapshotUri)
-     - Direct ONVIF PTZ ContinuousMove, Stop, RelativeMove, and Presets (list/goto/set/remove)
+     - Direct ONVIF PTZ ContinuousMove, Stop, and RelativeMove
      - Direct RTSP audio capture via ffmpeg
      - WS-Security UsernameToken (digest and plaintext) authentication
 """
@@ -57,7 +57,6 @@ class LanCamera:
     model: str = ""
     firmware: str = ""
     ptz_supported: bool = True
-    presets: list[dict[str, str]] = field(default_factory=list)
     last_seen: float = 0.0
 
 def _xml_text(elem: ET.Element, tag_name: str) -> str:
@@ -362,22 +361,6 @@ class LanEngine:
             except Exception:
                 pass
 
-        # Presets enumeration
-        presets = []
-        try:
-            st_pr, pr_resp = self.onvif_soap(ptz_url, "http://www.onvif.org/ver20/ptz/wsdl/GetPresets",
-                                            f"<tptz:GetPresets><tptz:ProfileToken>{profile_token}</tptz:ProfileToken></tptz:GetPresets>",
-                                            username, password)
-            if st_pr < 300 and "<Fault>" not in pr_resp:
-                root_pr = ET.fromstring(pr_resp)
-                for pr in root_pr.iter():
-                    if pr.tag.rsplit("}", 1)[-1] == "Preset":
-                        tok = pr.attrib.get("token", "")
-                        nm = _xml_text(pr, "Name") or tok
-                        if tok: presets.append({"token": tok, "name": nm})
-        except Exception:
-            pass
-
         cid = f"lan_{ip.replace('.', '_')}"
         cam = LanCamera(
             id=cid,
@@ -397,7 +380,6 @@ class LanEngine:
             model=model,
             firmware=fw,
             ptz_supported=bool(ptz_url),
-            presets=presets,
             last_seen=time.time()
         )
         with self.lock:
@@ -489,7 +471,6 @@ class LanEngine:
                     "snapshotUrl": c.snapshot_url,
                     "streamUri": c.stream_uri,
                     "ptzSupported": c.ptz_supported,
-                    "presetCount": len(c.presets),
                     "manufacturer": c.manufacturer,
                     "model": c.model,
                 }
