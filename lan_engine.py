@@ -307,7 +307,7 @@ class LanEngine:
         # room cameras. Exclude devices whose ONVIF identity explicitly says
         # recorder/NVR/DVR before attempting media profile registration.
         identity = " ".join((mfr, model, fw)).strip()
-        if re.search(r"\b(?:nvr|dvr|recorder|network video recorder|digital video recorder)\\b", identity, re.IGNORECASE):
+        if re.search(r"\b(?:nvr|dvr|recorder|network video recorder|digital video recorder)\b", identity, re.IGNORECASE):
             logger.info("[interrogate_onvif] Excluding recorder-class ONVIF device %s (%s)", ip, identity)
             return None
 
