@@ -125,7 +125,7 @@ class LanEngine:
         socket behavior, which is unreliable on Android/Termux.
         """
         message_id = f"urn:uuid:{uuid.uuid4()}"
-        probe = f\'''<?xml version="1.0" encoding="UTF-8"?>
+        probe = f'''<?xml version="1.0" encoding="UTF-8"?>
 <e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
  xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
  xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
@@ -136,7 +136,7 @@ class LanEngine:
   <w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
  </e:Header>
  <e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body>
-</e:Envelope>\'''.encode("utf-8")
+</e:Envelope>'''.encode("utf-8")
 
         found: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
