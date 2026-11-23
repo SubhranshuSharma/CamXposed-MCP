@@ -924,7 +924,11 @@ class Client:
         return json.loads(b.decode())
 
     def onvif_soap(self, endpoint, action, body_xml, username="admin", password=""):
-        """Direct lightweight ONVIF SOAP caller with WS-Security UsernameToken Digest/Text support."""
+        """Direct lightweight ONVIF SOAP caller with WS-Security UsernameToken Digest/Text support.
+
+CAMERA RESOLUTION: Registers only usable cameras with media profiles; NVR/DVR/recorder endpoints are excluded.
+
+CAMERA RESOLUTION: Returns only validated native LAN cameras with usable media profiles."""
         nonce = os.urandom(16)
         created = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         import hashlib
@@ -1029,7 +1033,9 @@ async def alert_image_route(request):
 
 @mcp.tool()
 def camera_discover():
-    """Discover CamXposed gateways and ONVIF cameras on LAN using native multi-protocol discovery (WS-Discovery UDP 3702, UPnP SSDP UDP 1900, mDNS DNS-SD)."""
+    """Discover CamXposed gateways and ONVIF cameras on LAN using native multi-protocol discovery (WS-Discovery UDP 3702, UPnP SSDP UDP 1900, mDNS DNS-SD).
+
+CAMERA RESOLUTION: Discover camera devices only. NVR/DVR/recorder endpoints and ONVIF devices without usable media profiles are excluded."""
     lan_res = lan_engine.discover_all(timeout=2.0)
     # Refresh the combined camera list immediately after the live LAN scan.
     with client.lock:
@@ -1055,7 +1061,9 @@ def camera_discover():
 
 @mcp.tool()
 def camera_list():
-    """List available cameras (both native LAN ONVIF cameras and bridge-managed cameras). Default camera is automatically targeted by move/observe/speak."""
+    """List available cameras (both native LAN ONVIF cameras and bridge-managed cameras). Default camera is automatically targeted by move/observe/speak.
+
+CAMERA RESOLUTION: Returns usable cameras only; NVR/DVR/recorder endpoints are filtered during discovery."""
     g = None
     try:
         g = client.gateway()
@@ -1148,7 +1156,9 @@ def camera_presets(camera_id: Optional[str] = None, action: str = "list", preset
     - action: "list" (enumerate presets), "goto" (move to preset_token), "set" (save current position as preset with name), or "remove" (delete preset_token).
     - preset_token: Token of the preset (e.g. "PRESET_1"), required for "goto" and "remove".
     - name: Friendly name when setting a preset (e.g. "Door", "Desk"), required for "set".
-    """
+    
+
+CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
     g, cid = client.resolve_camera(camera_id)
     ip = None
     if cid.startswith("lan_"):
@@ -1189,7 +1199,9 @@ def camera_presets(camera_id: Optional[str] = None, action: str = "list", preset
 
 @mcp.tool()
 def camera_ptz_capabilities(camera_id: Optional[str] = None):
-    """Read the selected ONVIF camera's advertised PTZ capabilities, including velocity ranges, speed spaces, translation spaces, position spaces, and timeout range."""
+    """Read the selected ONVIF camera's advertised PTZ capabilities, including velocity ranges, speed spaces, translation spaces, position spaces, and timeout range.
+
+CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
     g, cid = client.resolve_camera(camera_id)
     lan_cam = client.find_lan_camera(cid)
     if lan_cam:
@@ -1203,7 +1215,9 @@ def camera_ptz_capabilities(camera_id: Optional[str] = None):
 
 @mcp.tool()
 def camera_ptz_status(camera_id: Optional[str] = None):
-    """Read current ONVIF pan, tilt, zoom position coordinates and move status (IDLE/MOVING)."""
+    """Read current ONVIF pan, tilt, zoom position coordinates and move status (IDLE/MOVING).
+
+CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
     g, cid = client.resolve_camera(camera_id)
     lan_cam = client.find_lan_camera(cid)
     if lan_cam:
@@ -1225,7 +1239,9 @@ def camera_ptz_relative_move(camera_id: Optional[str] = None, x: float = 0.0, y:
     - zoom: Normalized relative zoom offset (-1.0 to 1.0).
     - speed: Integer 1-8 controlling the movement speed. Default is 4.
     - wait: Boolean. Default is True. Waits for mechanical settling before returning.
-    """
+    
+
+CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
     g, cid = client.resolve_camera(camera_id)
     lan_cam = client.find_lan_camera(cid)
     if not lan_cam:
@@ -1251,7 +1267,9 @@ def camera_ptz_relative_move(camera_id: Optional[str] = None, x: float = 0.0, y:
 
 @mcp.tool()
 def camera_select(camera_id:str):
-    """Select/connect one camera for default operations. Input is an ID from camera_list(). Returns the selected camera."""
+    """Select/connect one camera for default operations. Input is an ID from camera_list(). Returns the selected camera.
+
+CAMERA RESOLUTION: Use only when the user explicitly chooses a camera. Other camera tools resolve selection automatically."""
     cs=client.cameras()
     c=next((x for x in cs if x.id==camera_id),None)
     if not c:
@@ -1271,7 +1289,9 @@ def camera_select(camera_id:str):
 
 @mcp.tool()
 def camera_status(camera_id:Optional[str]=None):
-    """Return camera liveness and capabilities. Uses the explicitly supplied camera_id; otherwise the selected camera, or automatically discovers and selects the first available camera."""
+    """Return camera liveness and capabilities. Uses the explicitly supplied camera_id; otherwise the selected camera, or automatically discovers and selects the first available camera.
+
+CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Refresh stale camera state automatically."""
     g, cid = client.resolve_camera(camera_id)
     cs = client.cameras(g, force_refresh=True)
     lan_cam = client.find_lan_camera(cid)
@@ -1403,7 +1423,9 @@ def camera_observe(camera_id:Optional[str]=None,width:int=800,latest_frame:bool=
 
     WARNING: latest_frame=True bypasses this wait and may return a stale or
     mid-movement frame. Use only when you intentionally want an immediate grab.
-    """
+    
+
+CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
     g, cid = client.resolve_camera(camera_id)
     try: client.connect(g, cid)
     except Exception: pass
@@ -1425,7 +1447,9 @@ def camera_observe(camera_id:Optional[str]=None,width:int=800,latest_frame:bool=
 
 @mcp.tool()
 def camera_listen(camera_id:Optional[str]=None,seconds:float=2):
-    """Capture a short audio sample for inspection. seconds is 0.25-5."""
+    """Capture a short audio sample for inspection. seconds is 0.25-5.
+
+CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
     g, cid = client.resolve_camera(camera_id)
     try: client.connect(g, cid)
     except Exception: pass
@@ -1448,7 +1472,9 @@ def camera_move(camera_id:Optional[str]=None,direction:str="right",speed:int=8,d
     - speed: Integer 1-8. Default is 8. (Always prefer 7 or 8 for real, visible motion).
     - duration_ms: Movement duration in milliseconds (100-2000). Default is 700 ms. (600-1200 ms recommended).
     - wait: Boolean. Default is True. Waits for the physical movement to complete and settle before returning, ensuring the camera is completely still before any subsequent camera_observe frame capture.
-    """
+    
+
+CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
     dir_clean = str(direction).strip().lower()
     if dir_clean not in {"left", "right", "up", "down", "stop"}:
         logger.warning(f"[camera_move] Unknown direction '{direction}', defaulting to 'stop'")
@@ -1603,7 +1629,9 @@ def camera_speak(text:str, camera_id:Optional[str]=None, wait:bool=False, voice:
         </speak>
 
     Playback streams in real-time. Can be interrupted at any moment using camera_speak_stop.
-    """
+    
+
+CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
     g, cid = client.resolve_camera(camera_id)
     try: client.connect(g, cid)
     except Exception: pass
@@ -1618,7 +1646,9 @@ def camera_speak(text:str, camera_id:Optional[str]=None, wait:bool=False, voice:
 
 @mcp.tool()
 def camera_speak_stop(camera_id:Optional[str]=None, reason:str="user_barge_in"):
-    """Immediately stop and cut off any active camera speech/talkback playback. Use for instant barge-in response when user speaks or interrupts."""
+    """Immediately stop and cut off any active camera speech/talkback playback. Use for instant barge-in response when user speaks or interrupts.
+
+CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
     g, cid = client.resolve_camera(camera_id)
     logger.info(f"[camera_speak_stop] Stopping speech on camera {cid} (reason: {reason})")
     res = client.speak_stop(g, cid, reason)
