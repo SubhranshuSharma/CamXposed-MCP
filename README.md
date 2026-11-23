@@ -51,15 +51,7 @@ Optional environment variables:
 | `CAMXPOSED_ONVIF_PASS` | empty | Camera password |
 | `CAMXPOSED_LOG_DIR` | system temporary directory | Runtime logs |
 
-If no ngrok token is set for the Node SDK, the launcher prompts for it without echoing the token. Do not commit tokens or camera passwords.
-
-To replace the saved ngrok token later, run:
-
-```bash
-python run.py --change-token
-```
-
-This securely prompts for the replacement and overwrites the saved token. An explicitly supplied `NGROK_AUTHTOKEN` environment variable also takes precedence and updates the saved value. You can change the storage location with `CAMXPOSED_NGROK_TOKEN_FILE`.
+The launcher prompts for a token if none is saved. An explicitly supplied `NGROK_AUTHTOKEN` environment variable takes precedence and updates the saved value. You can change the token-file location with `CAMXPOSED_NGROK_TOKEN_FILE`. Do not commit tokens or camera passwords.
 
 Optional ONVIF credentials (default: `admin` with a blank password):
 
