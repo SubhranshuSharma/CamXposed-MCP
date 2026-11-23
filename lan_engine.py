@@ -119,31 +119,77 @@ class LanEngine:
             return 0, str(e)
 
     def probe_ws_discovery(self, timeout: float = 2.0) -> list[dict[str, Any]]:
-        """Active WS-Discovery Probe for NetworkVideoTransmitter over UDP 3702."""
-        found = []
+        """Perform ONVIF WS-Discovery using the Python standard library.
+
+        This deliberately avoids wsdiscovery's platform-specific multicast
+        socket behavior, which is unreliable on Android/Termux.
+        """
+        message_id = f"urn:uuid:{uuid.uuid4()}"
+        probe = f\'''<?xml version="1.0" encoding="UTF-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
+ xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+ <e:Header>
+  <w:MessageID>{message_id}</w:MessageID>
+  <w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>
+  <w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
+ </e:Header>
+ <e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body>
+</e:Envelope>\'''.encode("utf-8")
+
+        found: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         try:
-            from wsdiscovery import WSDiscovery
-            wsd = WSDiscovery()
-            wsd.start()
-            services = wsd.searchServices(timeout=int(timeout))
-            for s in services:
-                epr = s.getEPR() or ""
-                xaddrs = s.getXAddrs() or []
-                types = [str(t) for t in (s.getTypes() or [])]
-                scopes = [str(sc) for sc in (s.getScopes() or [])]
-                is_onvif = any("networkvideotransmitter" in t.lower() or "device" in t.lower() for t in types) or any("onvif" in x.lower() for x in xaddrs)
-                found.append({
-                    "epr": epr,
-                    "xaddrs": xaddrs,
-                    "types": types,
-                    "scopes": scopes,
-                    "isOnvif": is_onvif,
-                    "source": "ws-discovery-lib"
-                })
-            wsd.stop()
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", 0))
+            sock.settimeout(0.25)
+            sock.sendto(probe, WS_DISCOVERY_ADDR)
+            deadline = time.monotonic() + max(0.5, float(timeout))
+            while time.monotonic() < deadline:
+                try:
+                    data, addr = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                try:
+                    root = ET.fromstring(data)
+                    xaddrs = []
+                    types = []
+                    scopes = []
+                    epr = ""
+                    for node in root.iter():
+                        tag = node.tag.rsplit("}", 1)[-1]
+                        value = (node.text or "").strip()
+                        if tag == "XAddrs" and value:
+                            xaddrs.extend(value.split())
+                        elif tag == "Types" and value:
+                            types.extend(value.split())
+                        elif tag == "Scopes" and value:
+                            scopes.extend(value.split())
+                        elif tag == "Address" and value and value.startswith("urn:"):
+                            epr = value
+                    if not xaddrs:
+                        continue
+                    key = (addr[0], tuple(sorted(xaddrs)))
+                    found[key] = {
+                        "epr": epr,
+                        "xaddrs": xaddrs,
+                        "types": types,
+                        "scopes": scopes,
+                        "isOnvif": True,
+                        "source": "ws-discovery-udp",
+                        "sourceIp": addr[0],
+                    }
+                except ET.ParseError:
+                    logger.debug("[probe_ws_discovery] Ignoring non-XML UDP response from %s", addr[0])
         except Exception as e:
-            logger.warning(f"[probe_ws_discovery] Exception: {e}")
-        return found
+            logger.warning(f"[probe_ws_discovery] Native UDP probe failed: {e}")
+        finally:
+            sock.close()
+        results = list(found.values())
+        logger.info("[probe_ws_discovery] Native UDP discovery received %d ONVIF response(s)", len(results))
+        return results
 
     def probe_ssdp(self, timeout: float = 1.5) -> list[dict[str, Any]]:
         """Active UPnP SSDP M-SEARCH over UDP 1900."""
