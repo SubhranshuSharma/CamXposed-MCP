@@ -1100,12 +1100,17 @@ def camera_list():
             discovery_error = str(exc)
             logger.warning("[camera_list] Automatic LAN discovery failed: %s", exc)
 
-    # Preserve bridge-managed cameras as well as native LAN cameras.
+    # Native LAN cameras are first priority. Avoid gateway discovery/network
+    # round-trips entirely when a usable local camera is already available.
+    with lan_engine.lock:
+        local_camera_count = len(lan_engine.discovered_cameras)
+
     g = None
-    try:
-        g = client.gateway()
-    except Exception as exc:
-        logger.info("[camera_list] CamXposed gateway unavailable during listing: %s", exc)
+    if local_camera_count == 0:
+        try:
+            g = client.gateway()
+        except Exception as exc:
+            logger.info("[camera_list] CamXposed gateway unavailable during listing: %s", exc)
 
     cs = client.cameras(g, force_refresh=discovery is not None or discovery_error is not None)
 
@@ -1138,7 +1143,6 @@ def camera_list():
         result["automaticDiscovery"] = {"attempted": False, "reason": "recent inventory reused"}
     return result
 
-@mcp.tool()
 def onvif_discover(timeout_seconds: float = 2.0):
     """Trigger native active ONVIF discovery directly from MCP across WS-Discovery, UPnP SSDP, and mDNS.
     
@@ -1154,7 +1158,6 @@ def onvif_discover(timeout_seconds: float = 2.0):
                     client.camera = None
     return result
 
-@mcp.tool()
 def onvif_cameras():
     """Return the currently discovered native ONVIF camera inventory from MCP memory."""
     with lan_engine.lock:
@@ -1208,7 +1211,6 @@ def onvif_inspect(ip_address: str, device_service_url: Optional[str] = None, use
         }
     return {"ok": False, "error": f"Failed to interrogate ONVIF camera at {ip_address}"}
 
-@mcp.tool()
 def camera_presets(camera_id: Optional[str] = None, action: str = "list", preset_token: Optional[str] = None, name: Optional[str] = None, username: Optional[str] = "admin", password: Optional[str] = ""):
     """Manage and navigate PTZ presets on an ONVIF-capable camera.
     
@@ -1258,7 +1260,6 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
         port=port,
     )
 
-@mcp.tool()
 def camera_ptz_capabilities(camera_id: Optional[str] = None):
     """Read the selected ONVIF camera's advertised PTZ capabilities, including velocity ranges, speed spaces, translation spaces, position spaces, and timeout range.
 
@@ -1274,7 +1275,6 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
             return json.loads(data.decode())
     return {"ok": False, "error": f"Camera {cid} does not expose ONVIF PTZ capabilities"}
 
-@mcp.tool()
 def camera_ptz_status(camera_id: Optional[str] = None):
     """Read current ONVIF pan, tilt, zoom position coordinates and move status (IDLE/MOVING).
 
@@ -1289,7 +1289,6 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
             return json.loads(data.decode())
     return {"ok": False, "error": f"Camera {cid} does not expose ONVIF PTZ status"}
 
-@mcp.tool()
 def camera_ptz_relative_move(camera_id: Optional[str] = None, x: float = 0.0, y: float = 0.0, zoom: float = 0.0, speed: int = 4, wait: bool = True):
     """Perform a finite ONVIF RelativeMove using normalized translation offsets and speed.
     
@@ -1519,7 +1518,6 @@ CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; other
     logger.info(f"[camera_listen] Done listening to camera {cid}")
     return res
 
-@mcp.tool()
 def camera_move(camera_id:Optional[str]=None,direction:str="right",speed:int=8,duration_ms:int=700,wait:bool=True):
     """Perform one manual PTZ move on the camera.
 
@@ -1577,6 +1575,61 @@ CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; other
 
     logger.info(f"[camera_move] PTZ completed: {result}. Settled.")
     return result
+
+@mcp.tool()
+def camera_ptz(
+    action: str = "move",
+    camera_id: Optional[str] = None,
+    direction: str = "right",
+    speed: int = 8,
+    duration_ms: int = 700,
+    wait: bool = True,
+    x: float = 0.0,
+    y: float = 0.0,
+    zoom: float = 0.0,
+    preset_token: Optional[str] = None,
+    name: Optional[str] = None,
+):
+    """Unified local-first PTZ control.
+
+    Actions:
+    - move: directional pan/tilt movement; direction left/right/up/down/stop.
+    - relative_move: finite normalized movement; x/y/zoom range -1.0..1.0.
+    - status: current position and IDLE/MOVING state.
+    - capabilities: advertised PTZ ranges and supported spaces.
+    - presets_list, preset_goto, preset_set, preset_remove: manage camera presets.
+
+    Uses the native LAN ONVIF camera directly whenever available. The Android
+    bridge is only a fallback for bridge-managed cameras. Camera selection and
+    discovery are automatic; do not call discovery or selection first.
+    """
+    op = str(action or "move").strip().lower()
+    if op == "move":
+        return camera_move(camera_id, direction, speed, duration_ms, wait)
+    if op == "relative_move":
+        return camera_ptz_relative_move(camera_id, x, y, zoom, speed, wait)
+    if op == "status":
+        return camera_ptz_status(camera_id)
+    if op == "capabilities":
+        return camera_ptz_capabilities(camera_id)
+    if op in {"presets_list", "preset_goto", "preset_set", "preset_remove"}:
+        preset_action = {
+            "presets_list": "list",
+            "preset_goto": "goto",
+            "preset_set": "set",
+            "preset_remove": "remove",
+        }[op]
+        return camera_presets(
+            camera_id=camera_id,
+            action=preset_action,
+            preset_token=preset_token,
+            name=name,
+        )
+    raise ValueError(
+        "action must be move, relative_move, status, capabilities, "
+        "presets_list, preset_goto, preset_set, or preset_remove"
+    )
+
 
 def tts(text: str, voice: Optional[str] = None, volume_percent: Optional[int] = None):
     """Generate speech or singing/melodic audio with Edge TTS, then encode it for camera talkback.
@@ -1636,7 +1689,6 @@ def tts(text: str, voice: Optional[str] = None, volume_percent: Optional[int] = 
         try: os.unlink(mp3)
         except OSError: pass
 
-@mcp.tool()
 def camera_speaker_volume(volume_percent: Optional[int] = None) -> dict[str, Any]:
     """Get or set the physical camera speaker talkback volume percentage (0-100%).
     
@@ -1660,7 +1712,9 @@ def camera_speaker_volume(volume_percent: Optional[int] = None) -> dict[str, Any
     }
 
 @mcp.tool()
-def camera_speak(text:str, camera_id:Optional[str]=None, wait:bool=False, voice:Optional[str]=None, volume_percent:Optional[int]=None):
+def camera_speak(text: Optional[str] = None, camera_id: Optional[str] = None, wait: bool = False,
+                 voice: Optional[str] = None, volume_percent: Optional[int] = None,
+                 action: str = "speak"):
     """Broadcast spoken announcements, singing, or melodies out loud into the physical room through the camera speaker.
 
     CRITICAL USAGE INSTRUCTIONS:
@@ -1693,6 +1747,18 @@ def camera_speak(text:str, camera_id:Optional[str]=None, wait:bool=False, voice:
     
 
 CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
+    op = str(action or "speak").strip().lower()
+    if op == "get_volume":
+        return camera_speaker_volume()
+    if op == "set_volume":
+        if volume_percent is None:
+            raise ValueError("volume_percent is required for action='set_volume'")
+        return camera_speaker_volume(volume_percent)
+    if op != "speak":
+        raise ValueError("action must be speak, get_volume, or set_volume")
+    if not text or not str(text).strip():
+        raise ValueError("text is required for action='speak'")
+
     g, cid = client.resolve_camera(camera_id)
     try: client.connect(g, cid)
     except Exception: pass
