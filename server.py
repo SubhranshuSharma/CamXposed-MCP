@@ -21,7 +21,7 @@ from mcp.types import AudioContent, TextContent
 mcp = MCPServer(
     name="कैमXposed",
     title="कैमXposed",
-    description="CamXposed MCP Bridge - Smart IP Camera Control, Vision & PTZ",
+    description="CamXposed MCP Bridge - Smart IP Camera Control, Vision & PTZ. DEFAULT CAMERA RULE: For every camera-targeted operation, use an explicitly supplied camera_id when present; otherwise use the currently selected camera; if none is selected, automatically run LAN ONVIF discovery, select the first discovered camera, and execute the requested operation. Never stop at an empty inventory or ask the user to run discovery manually. Listing/discovery tools remain callable directly.",
     version="1.0.0",
 )
 # Discovery uses native WS-Discovery over UDP 3702. No Avahi, zeroconf, or UPnP dependency.
