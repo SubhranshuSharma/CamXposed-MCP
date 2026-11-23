@@ -1169,15 +1169,22 @@ def camera_presets(camera_id: Optional[str] = None, action: str = "list", preset
             except Exception:
                 pass
     if not ip:
-        ip = os.getenv("CAMXPOSED_DEFAULT_ONVIF_IP", "10.64.137.213")
+        raise RuntimeError(
+            f"Selected camera {cid} has no native ONVIF address; refusing to use a hardcoded/stale camera IP."
+        )
 
+    lan_cam = client.find_lan_camera(cid)
+    profile_token = lan_cam.profile_token if lan_cam else "PROFILE_000"
+    port = lan_cam.port if lan_cam else 8888
     return client.onvif_presets(
         camera_ip=ip,
         action=action,
         preset_token=preset_token,
         preset_name=name,
-        username=username or "admin",
-        password=password or "",
+        username=(lan_cam.username if lan_cam else username) or "admin",
+        password=(lan_cam.password if lan_cam else password) or "",
+        profile_token=profile_token or "PROFILE_000",
+        port=port,
     )
 
 @mcp.tool()
@@ -1264,11 +1271,9 @@ def camera_select(camera_id:str):
 
 @mcp.tool()
 def camera_status(camera_id:Optional[str]=None):
-    """Return camera liveness and capabilities. Omit camera_id for the current/default camera."""
-    cs=client.cameras()
-    cid=camera_id or client.camera or (cs[0].id if cs else None)
-    if not cid:
-        raise RuntimeError("No camera available")
+    """Return camera liveness and capabilities. Uses the explicitly supplied camera_id; otherwise the selected camera, or automatically discovers and selects the first available camera."""
+    g, cid = client.resolve_camera(camera_id)
+    cs = client.cameras(g, force_refresh=True)
     lan_cam = client.find_lan_camera(cid)
     if lan_cam:
         return {
