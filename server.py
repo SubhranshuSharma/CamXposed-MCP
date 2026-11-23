@@ -416,7 +416,7 @@ class Client:
                 return None, lan_cam.id
             # An explicit native LAN ID/IP may have changed after DHCP renewal.
             # Refresh once before treating it as a bridge camera identifier.
-            if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", target):
+            if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", target):
                 try:
                     lan_engine.discover_all(timeout=3.0)
                     lan_cam = self.find_lan_camera(target)
@@ -438,7 +438,7 @@ class Client:
             lan_cam = self.find_lan_camera(selected)
             if lan_cam:
                 return None, selected
-            if selected.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", selected):
+            if selected.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", selected):
                 with self.lock:
                     if self.camera == selected:
                         self.camera = None
