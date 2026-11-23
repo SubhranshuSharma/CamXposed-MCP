@@ -45,10 +45,9 @@ git clone https://github.com/SubhranshuSharma/CamXposed-MCP.git ~/camxposed-mcp
 cd ~/camxposed-mcp
 ```
 
-Set your ngrok token once for the current shell, then launch:
+On the first run, the launcher asks for your ngrok token once (hidden input) and saves it under `~/.config/camxposed-mcp/ngrok_token` with owner-only permissions. Future runs reuse it automatically. You do not need to export the token every time. Then launch:
 
 ```bash
-export NGROK_AUTHTOKEN="YOUR_NGROK_AUTHTOKEN"
 python run.py
 ```
 
@@ -70,6 +69,14 @@ Optional environment variables:
 | `CAMXPOSED_LOG_DIR` | system temporary directory | Runtime logs |
 
 If no ngrok token is set for the Node SDK, the launcher prompts for it without echoing the token. Do not commit tokens or camera passwords.
+
+To replace the saved ngrok token later, run:
+
+```bash
+python run.py --change-token
+```
+
+This securely prompts for the replacement and overwrites the saved token. An explicitly supplied `NGROK_AUTHTOKEN` environment variable also takes precedence and updates the saved value. You can change the storage location with `CAMXPOSED_NGROK_TOKEN_FILE`.
 
 Optional ONVIF credentials (default: `admin` with a blank password):
 
