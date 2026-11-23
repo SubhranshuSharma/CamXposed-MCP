@@ -1151,34 +1151,6 @@ def onvif_cameras():
         ]
     return {"ok": True, "provider": "native_lan", "count": len(cams), "cameras": cams}
 
-@mcp.tool()
-def onvif_inspect(ip_address: str, device_service_url: Optional[str] = None, username: Optional[str] = "admin", password: Optional[str] = ""):
-    """Interrogate an ONVIF camera at the given IP natively via ONVIF SOAP.
-    
-    Enumerates ONVIF capabilities, device information, PTZ services, and media profiles (RTSP stream and JPEG snapshot URIs).
-    """
-    cam = lan_engine.interrogate_onvif(str(ip_address).strip(), username=username or "admin", password=password or "")
-    if cam:
-        return {
-            "ok": True,
-            "provider": "native_onvif",
-            "camera": {
-                "id": cam.id,
-                "ip": cam.ip,
-                "name": cam.name,
-                "deviceServiceUrl": cam.device_service_url,
-                "mediaServiceUrl": cam.media_service_url,
-                "ptzServiceUrl": cam.ptz_service_url,
-                "snapshotUrl": cam.snapshot_url,
-                "streamUri": cam.stream_uri,
-                "profileToken": cam.profile_token,
-                "manufacturer": cam.manufacturer,
-                "model": cam.model,
-                "firmware": cam.firmware,
-            }
-        }
-    return {"ok": False, "error": f"Failed to interrogate ONVIF camera at {ip_address}"}
-
 def camera_ptz_capabilities(camera_id: Optional[str] = None):
     """Read the selected ONVIF camera's advertised PTZ capabilities, including velocity ranges, speed spaces, translation spaces, position spaces, and timeout range.
 
