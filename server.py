@@ -342,17 +342,6 @@ class Client:
             if attempt + 1 < retries:
                 time.sleep(0.25)
 
-        # Fast fallback: if WS-Discovery UDP dropped or delayed, probe the known bridge IP directly
-        try:
-            fallback_g = Gateway(EXPECTED_UUID, "192.168.1.7", 18766, "lan-fallback", {})
-            if self.live(fallback_g):
-                with self.lock:
-                    self.gateways[fallback_g.uuid] = fallback_g
-                    self.selected = fallback_g.uuid
-                return fallback_g
-        except Exception:
-            pass
-
         detail = self.last_discovery_error or {"message": "No WS-Discovery result."}
         raise DiscoveryError(json.dumps(detail, ensure_ascii=False))
 
@@ -436,10 +425,15 @@ class Client:
                 lan_cam = self.find_lan_camera(self.camera)
                 if lan_cam:
                     return None, self.camera
-                try:
-                    return self.gateway(), self.camera
-                except Exception:
-                    return None, self.camera
+                # A previously selected native LAN camera may have moved to a new
+                # DHCP address. Never route its stale lan_<ip> ID through the gateway.
+                if self.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", self.camera):
+                    self.camera = None
+                else:
+                    try:
+                        return self.gateway(), self.camera
+                    except Exception:
+                        return None, self.camera
 
         # Check native LAN cameras first
         with lan_engine.lock:
@@ -1008,6 +1002,14 @@ async def alert_image_route(request):
 def camera_discover():
     """Discover CamXposed gateways and ONVIF cameras on LAN using native multi-protocol discovery (WS-Discovery UDP 3702, UPnP SSDP UDP 1900, mDNS DNS-SD)."""
     lan_res = lan_engine.discover_all(timeout=2.0)
+    # Refresh the combined camera list immediately after the live LAN scan.
+    with client.lock:
+        client.cached_cameras = []
+        client.cached_cameras_time = 0.0
+        if client.camera and (client.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", client.camera)):
+            with lan_engine.lock:
+                if client.camera not in lan_engine.discovered_cameras:
+                    client.camera = None
     gs = client.discover()
     gateways = [gj(g) for g in gs]
     for gw in lan_res.get("discoveredGateways", []):
@@ -1044,7 +1046,15 @@ def onvif_discover(timeout_seconds: float = 2.0):
     
     Discovers all LAN ONVIF cameras, inspects device capabilities, and registers them directly into MCP.
     """
-    return lan_engine.discover_all(timeout=max(1.0, min(10.0, float(timeout_seconds))))
+    result = lan_engine.discover_all(timeout=max(1.0, min(10.0, float(timeout_seconds))))
+    with client.lock:
+        client.cached_cameras = []
+        client.cached_cameras_time = 0.0
+        if client.camera and (client.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", client.camera)):
+            with lan_engine.lock:
+                if client.camera not in lan_engine.discovered_cameras:
+                    client.camera = None
+    return result
 
 @mcp.tool()
 def onvif_cameras():
