@@ -193,10 +193,7 @@ class DiscoveryError(RuntimeError):
 
 class Client:
     def __init__(self):
-        self.gateways={}; self.selected=None; self.camera=None; self.lock=threading.RLock(); self.last_discovery_error=None; self.alert_cursor=0
-        self.alert_watch_enabled=False
-        self.alert_watch_camera_ids: Optional[set[str]]=None
-        self.alert_watch_since_id=0
+        self.gateways={}; self.selected=None; self.camera=None; self.lock=threading.RLock(); self.last_discovery_error=None
         # Per-camera monotonic deadline for the most recent timed PTZ movement.
         self.ptz_move_until = {}
         self.ptz_state_lock = threading.Lock()
@@ -910,23 +907,6 @@ class Client:
             "durationMs": duration_ms,
             "message": f"Camera is now speaking via gateway ({duration_ms}ms estimated). Call camera_speak_stop to interrupt."
         }
-    def alerts(self,g,since_id=0,limit=50):
-        limit=max(1,min(200,int(limit)))
-        url=f"{g.base}/v1/alerts?sinceId={max(0,int(since_id))}&limit={limit}"
-        c,b,_=self.http("GET",url,timeout=HTTP_TIMEOUT)
-        if c>=300: raise RuntimeError(f"/v1/alerts HTTP {c}: {b.decode(errors='replace')}")
-        data=json.loads(b.decode())
-        if not data.get("ok"): raise RuntimeError("Bridge returned unsuccessful alert response")
-        # Canonical camera identity is always a string. Never infer identity from nickname/index.
-        for event in data.get("events", []):
-            raw_id = event.get("cameraId")
-            event["cameraId"] = str(raw_id).strip() if raw_id not in (None, "") else ""
-            if event.get("rawCameraId") is not None:
-                event["rawCameraId"] = str(event["rawCameraId"]).strip()
-            event.setdefault("imageAvailable", False)
-            event.setdefault("imagePath", f"/v1/alerts/{int(event.get('id', 0))}/image")
-        return data
-
     def onvif_discover(self, g):
         c, b, _ = self.http("POST", f"{g.base}/v1/onvif/discover", b"", {"Content-Type": "application/json"}, timeout=12)
         if c >= 300: raise RuntimeError(f"/v1/onvif/discover HTTP {c}: {b.decode(errors='replace')}")
@@ -999,22 +979,6 @@ async def snapshot_route(request):
         return Response(data, media_type="image/jpeg")
     return Response(b"No snapshot available yet. Call camera_observe first.", status_code=404, media_type="text/plain")
 
-@mcp.custom_route("/alert_image.jpg", methods=["GET"])
-async def alert_image_route(request):
-    from starlette.responses import Response
-    alert_id = request.query_params.get("id")
-    if not alert_id:
-        return Response(b"Missing 'id' query parameter", status_code=400, media_type="text/plain")
-    try:
-        g = client.gateway()
-        status, data, headers = client.http("GET", f"{g.base}/v1/alerts/{int(alert_id)}/image", timeout=HTTP_TIMEOUT)
-        if status == 200:
-            content_type = headers.get("Content-Type", "image/jpeg")
-            return Response(data, media_type=content_type)
-        return Response(b"Image not found", status_code=status, media_type="text/plain")
-    except Exception as e:
-        return Response(str(e).encode(), status_code=500, media_type="text/plain")
-
 @mcp.tool()
 def camera_discover():
     """Discover CamXposed gateways and ONVIF cameras on LAN using native multi-protocol discovery (WS-Discovery UDP 3702, UPnP SSDP UDP 1900, mDNS DNS-SD).
@@ -1030,6 +994,30 @@ CAMERA RESOLUTION: Discover camera devices only. NVR/DVR/recorder endpoints and 
                 if client.camera not in lan_engine.discovered_cameras:
                     client.camera = None
     gs = client.discover()
+    # Validate the gateway advertisements returned by this exact LAN scan.
+    # This avoids relying only on the discovery cache when mDNS/SSDP found it.
+    for item in lan_res.get("discoveredGateways", []):
+        host = str(item.get("host", "")).strip()
+        try:
+            port = int(item.get("port", 18766))
+        except (TypeError, ValueError):
+            continue
+        if not host or port <= 0:
+            continue
+        props = item.get("properties") or {}
+        uid = str(props.get("uuid") or item.get("uuid") or f"{host}:{port}")
+        candidate = client.gateways.get(uid) or Gateway(
+            uuid=uid, host=host, port=port,
+            name=str(props.get("camera") or props.get("brand") or "CamXposed"),
+            txt={str(k): str(v) for k, v in props.items()},
+        )
+        if client.live(candidate):
+            with client.lock:
+                client.gateways[uid] = candidate
+                if not client.selected:
+                    client.selected = uid
+            if not any(g.uuid == uid for g in gs):
+                gs.append(candidate)
     gateways = [gj(g) for g in gs]
     for gw in lan_res.get("discoveredGateways", []):
         if not any(g["host"] == gw["host"] for g in gateways):
@@ -1305,103 +1293,6 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
     except Exception: pass
     c=next((c for c in cs if c.id==cid), None)
     return {"ok":True,"gateway":gj(g) if g else None,"camera":cj(c) if c else {"id": cid}}
-@mcp.tool()
-def camera_alerts(since_id:Optional[int]=None, limit:int=50, camera_id:Optional[str]=None):
-    """Read queued FCM human-body detection events. Camera IDs are canonical UID strings (or LAN format "lan_192_168_1_x"). Use since_id to resume. Image metadata is included when available; call camera_alert_image(event_id) for the image."""
-    g=client.gateway()
-    cursor=client.alert_cursor if since_id is None else max(0,int(since_id))
-    data=client.alerts(g,cursor,max(1,min(int(limit),200)))
-    events=data.get("events",[])
-    wanted=str(camera_id).strip() if camera_id is not None else None
-    if wanted is not None:
-        events=[e for e in events if str(e.get("cameraId", "")) == wanted]
-    # Advance past all scanned events even when a camera filter excludes them;
-    # otherwise the same unrelated events would be returned forever.
-    scanned_latest=max((int(e.get("id",0)) for e in data.get("events",[])), default=0)
-    if since_id is None:
-        client.alert_cursor=max(client.alert_cursor, scanned_latest, int(data.get("latestId",cursor)) if not data.get("events") else 0)
-    return {"ok":True,"gateway":gj(g),"alerts":events,"count":len(events),
-            "latestId":int(data.get("latestId",0)),"oldestId":int(data.get("oldestId",0)),
-            "droppedThroughId":int(data.get("droppedThroughId",0)),"cursor":client.alert_cursor,
-            "cameraIdFilter":wanted}
-
-@mcp.tool()
-def camera_watch_human_alerts(camera_ids:Optional[list[str]]=None, enabled:bool=True, since_id:Optional[int]=None):
-    """Arm or disarm the MCP server's persistent-in-process human-alert watch configuration. Camera IDs can be canonical numeric UIDs or "lan_192_168_1_x". This config tells the agent/runtime what events to wait for; it does not itself wake an idle host. A host automation must keep camera_wait_for_human_alert active or use its own supported wake trigger. Omit camera_ids to watch all cameras."""
-    with client.lock:
-        client.alert_watch_enabled=bool(enabled)
-        client.alert_watch_camera_ids=(None if camera_ids is None else {str(x).strip() for x in camera_ids if str(x).strip()})
-        if since_id is not None:
-            client.alert_watch_since_id=max(0,int(since_id))
-            client.alert_cursor=client.alert_watch_since_id
-        result={"ok":True,"enabled":client.alert_watch_enabled,
-                "cameraIds":None if client.alert_watch_camera_ids is None else sorted(client.alert_watch_camera_ids),
-                "sinceId":client.alert_watch_since_id,
-                "delivery":"blocking-tool-wait; host wake-up requires runtime support"}
-    return result
-
-@mcp.tool()
-def camera_alert_image(alert_id:int):
-    """Fetch the full notification image saved for a human-body alert and return it as a native MCP image. Use the event's id from camera_alerts or camera_wait_for_human_alert. Returns an error if that alert has no saved image."""
-    g=client.gateway()
-    event_id=max(1,int(alert_id))
-    status,data,headers=client.http("GET",f"{g.base}/v1/alerts/{event_id}/image",timeout=HTTP_TIMEOUT)
-    if status>=300:
-        try: detail=json.loads(data.decode()).get("error",data.decode(errors="replace"))
-        except Exception: detail=data.decode(errors="replace")
-        return {"ok":False,"alertId":event_id,"error":f"image fetch HTTP {status}: {detail}"}
-    content_type=headers.get("Content-Type",headers.get("content-type","image/jpeg")).split(";",1)[0].strip().lower()
-    image_format="png" if content_type=="image/png" else "jpeg"
-    return Image(data=data,format=image_format)
-
-@mcp.tool()
-def camera_wait_for_human_alert(timeout_seconds:int=30, since_id:Optional[int]=None, camera_id:Optional[str]=None):
-    """Block until a new human-body FCM alert arrives or timeout expires. Intended for an agent/runtime that explicitly arms a watch and keeps this wait active. The bridge currently exposes a bounded queue, so this MCP server checks that queue internally; it does not create an unsolicited agent turn by itself. camera_id can be canonical UID string or "lan_192_168_1_x"."""
-    timeout=max(1,min(int(timeout_seconds),120))
-    g=client.gateway()
-    with client.lock:
-        if not client.alert_watch_enabled:
-            # Backwards compatible: direct calls still work, but the tool tells the agent
-            # the persistent watch wasn't explicitly armed.
-            watch_ids=None
-        else:
-            watch_ids=client.alert_watch_camera_ids
-    wanted=str(camera_id).strip() if camera_id is not None else None
-    if wanted is None and watch_ids is not None and len(watch_ids)==1:
-        wanted=next(iter(watch_ids))
-    cursor=client.alert_cursor if since_id is None else max(0,int(since_id))
-    deadline=time.monotonic()+timeout
-    last=None
-    while True:
-        data=client.alerts(g,cursor,50)
-        events=data.get("events",[])
-        for event in events:
-            event_id=int(event.get("id",0))
-            if event_id <= cursor: continue
-            event_camera=str(event.get("cameraId", ""))
-            if wanted is not None and event_camera != wanted: continue
-            if watch_ids is not None and event_camera not in watch_ids: continue
-            client.alert_cursor=max(client.alert_cursor,event_id)
-            client.alert_watch_since_id=max(client.alert_watch_since_id,event_id)
-            return {"ok":True,"detected":True,"event":event,"cursor":client.alert_cursor,
-                    "imageAvailable":bool(event.get("imageAvailable",False)),
-                    "imageTool":"camera_alert_image","imageAlertId":event_id,
-                    "cameraId":event_camera,"remainingQueued":max(0,len(events)-1),
-                    "latestId":int(data.get("latestId",0)),
-                    "agentInstruction":"Evaluate this event and inspect camera_alert_image(imageAlertId) when an image is available."}
-        last=data
-        # Advance the local scan cursor past non-matching events so a camera filter
-        # cannot cause the same bounded page to be scanned repeatedly.
-        if events:
-            cursor=max(cursor,max(int(e.get("id",0)) for e in events))
-        elif data.get("latestId") is not None:
-            cursor=max(cursor,int(data.get("latestId",cursor)))
-        if time.monotonic()>=deadline:
-            return {"ok":True,"detected":False,"timeoutSeconds":timeout,
-                    "latestId":int(last.get("latestId",cursor)),"cursor":client.alert_cursor,
-                    "watchEnabled":client.alert_watch_enabled}
-        time.sleep(0.75)
-
 @mcp.tool()
 def camera_observe(camera_id:Optional[str]=None,width:int=800,latest_frame:bool=False):
     """Capture a frame from one camera and return a native MCP JPEG image.
