@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import importlib.util
+import json
 import os
 import platform
 import shutil
@@ -240,6 +241,38 @@ def start_ngrok():
     return proc, log, url.rstrip("/")
 
 
+def verify_remote_endpoint(endpoint: str, attempts: int = 12) -> bool:
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "camxposed-launcher-healthcheck", "version": "1.0"},
+        },
+    }).encode()
+    for _ in range(attempts):
+        request = urllib.request.Request(
+            endpoint, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                if response.status == 200:
+                    return True
+        except urllib.error.HTTPError as error:
+            if error.code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
 def stop_process(proc) -> None:
     if not proc or proc.poll() is not None:
         return
@@ -273,6 +306,11 @@ def main() -> int:
         say("Connecting ngrok remote tunnel...")
         tunnel_proc, tunnel_log, public_url = start_ngrok()
         endpoint = public_url + "/mcp"
+        say("Checking the public MCP endpoint...")
+        if verify_remote_endpoint(endpoint):
+            say("✓ Remote MCP handshake succeeded")
+        else:
+            say("! Tunnel is active, but the remote MCP handshake timed out; check the logs")
         say("")
         say("CAMXPOSED MCP IS READY")
         say(f"Remote MCP endpoint: {endpoint}")
