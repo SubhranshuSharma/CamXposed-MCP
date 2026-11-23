@@ -73,32 +73,42 @@ def ensure_python_dependencies() -> None:
     run_checked(command)
 
 
-def python_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    return env
+def termux_native_env() -> dict[str, str]:
+    """Expose Termux's active libpython to native extensions loaded via dlopen.
 
-
-def node_env() -> dict[str, str]:
+    Termux Python may not export interpreter symbols globally from the
+    executable. Rust/PyO3 wheels such as cryptography then fail to resolve
+    PyType_Type unless the matching libpython is preloaded.
+    """
     env = os.environ.copy()
     if not is_termux():
         return env
 
-    # Termux's Node native addons may need libpython preloaded. Resolve the
-    # actual Termux prefix so both Play Store and F-Droid installs work.
     prefix = Path(env.get("PREFIX", "/data/data/com.termux/files/usr"))
     pyver = f"{sys.version_info.major}.{sys.version_info.minor}"
     candidates = [
         prefix / "lib" / f"libpython{pyver}.so",
         prefix / "lib" / f"libpython{sys.version_info.major}.so",
     ]
-    library = next((p for p in candidates if p.exists()), None)
+    library = next((p for p in candidates if p.is_file()), None)
     if library:
         current = env.get("LD_PRELOAD", "")
         paths = [p for p in current.split(":") if p]
         if str(library) not in paths:
             env["LD_PRELOAD"] = ":".join([str(library), *paths])
     return env
+
+
+def python_env() -> dict[str, str]:
+    env = termux_native_env()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
+
+
+def node_env() -> dict[str, str]:
+    # Keep the same native runtime environment for both Python and Node
+    # children; this supports Termux installations from either distribution.
+    return termux_native_env()
 
 
 TOKEN_FILE = Path(os.getenv(
