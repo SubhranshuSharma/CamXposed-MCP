@@ -171,17 +171,16 @@ def wait_for_server(proc, timeout: float = 25.0) -> bool:
 
 
 def start_ngrok():
-    token = get_ngrok_token()
     ngrok = shutil.which("ngrok")
 
-    # Native ngrok CLI is the leanest option on desktop Linux.
+    # Native ngrok CLI can reuse an existing `ngrok config add-authtoken`
+    # configuration, so do not force a second token prompt on desktop Linux.
     if ngrok and not is_termux():
         command = [ngrok, "http", str(PORT)]
         if DOMAIN:
             command.append(f"--url=https://{DOMAIN}")
         log = open(TUNNEL_LOG, "a", encoding="utf-8")
         env = os.environ.copy()
-        env["NGROK_AUTHTOKEN"] = token
         proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
         time.sleep(1.5)
         if proc.poll() is not None:
@@ -189,6 +188,7 @@ def start_ngrok():
             raise RuntimeError(f"ngrok exited during startup; inspect {TUNNEL_LOG}")
         return proc, log, f"https://{DOMAIN}" if DOMAIN else ""
 
+    token = get_ngrok_token()
     node, env = ensure_termux_ngrok_sdk() if is_termux() else (shutil.which("node"), os.environ.copy())
     if not node:
         raise RuntimeError("Install ngrok CLI on Linux, or install Node.js to use the ngrok SDK fallback.")
