@@ -2,7 +2,6 @@
 # One-time bootstrap for CamXposed MCP. Safe to run as: curl -fsSL URL | sh
 set -eu
 
-REPO_URL="https://github.com/SubhranshuSharma/CamXposed-MCP.git"
 INSTALL_DIR="${CAMXPOSED_INSTALL_DIR:-$HOME/camxposed-mcp}"
 
 say() { printf '%s\n' "$*"; }
@@ -56,6 +55,10 @@ if [ -e "$INSTALL_DIR" ]; then
   esac
   [ -z "$(git -C "$INSTALL_DIR" status --porcelain)" ] || fail "$INSTALL_DIR has local changes. Commit/stash them or choose another CAMXPOSED_INSTALL_DIR."
   say "Updating existing CamXposed MCP checkout..."
+  branch="$(git -C "$INSTALL_DIR" branch --show-current)"
+  if [ "$branch" != "main" ]; then
+    git -C "$INSTALL_DIR" checkout main
+  fi
   git -C "$INSTALL_DIR" pull --ff-only origin main
 else
   say "Cloning CamXposed MCP into $INSTALL_DIR ..."
