@@ -414,52 +414,76 @@ class Client:
             lan_cam = self.find_lan_camera(target)
             if lan_cam:
                 return None, lan_cam.id
+            # An explicit native LAN ID/IP may have changed after DHCP renewal.
+            # Refresh once before treating it as a bridge camera identifier.
+            if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", target):
+                try:
+                    lan_engine.discover_all(timeout=3.0)
+                    lan_cam = self.find_lan_camera(target)
+                    if lan_cam:
+                        return None, lan_cam.id
+                except Exception as e:
+                    logger.warning(f"[resolve_camera] Native LAN refresh failed: {e}")
             try:
                 g = self.gateway()
                 return g, target
             except Exception:
                 return None, target
 
+        # Reuse a selected camera only while it is still present. If its DHCP
+        # address changed, discard the stale ID and run a fresh LAN discovery.
         with self.lock:
-            if self.camera:
-                lan_cam = self.find_lan_camera(self.camera)
-                if lan_cam:
-                    return None, self.camera
-                # A previously selected native LAN camera may have moved to a new
-                # DHCP address. Never route its stale lan_<ip> ID through the gateway.
-                if self.camera.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", self.camera):
-                    self.camera = None
-                else:
-                    try:
-                        return self.gateway(), self.camera
-                    except Exception:
-                        return None, self.camera
+            selected = self.camera
+        if selected:
+            lan_cam = self.find_lan_camera(selected)
+            if lan_cam:
+                return None, selected
+            if selected.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$", selected):
+                with self.lock:
+                    if self.camera == selected:
+                        self.camera = None
+            else:
+                try:
+                    return self.gateway(), selected
+                except Exception as e:
+                    logger.warning(f"[resolve_camera] Previously selected bridge camera unavailable: {e}")
+                    with self.lock:
+                        if self.camera == selected:
+                            self.camera = None
 
-        # Check native LAN cameras first
+        # Auto-discover before failing. The scan populates this process's own
+        # inventory, so callers never need to invoke discovery tools manually.
+        try:
+            if not lan_engine.discovered_cameras or (time.time() - lan_engine.last_scan_time) > 30.0:
+                logger.info("[resolve_camera] No fresh native camera inventory; running ONVIF discovery automatically")
+                scan = lan_engine.discover_all(timeout=3.0)
+                logger.info("[resolve_camera] Automatic ONVIF discovery found %s camera(s)",
+                            scan.get("discoveredCamerasCount", 0))
+        except Exception as e:
+            logger.warning(f"[resolve_camera] Automatic ONVIF discovery failed: {e}")
+
         with lan_engine.lock:
             if lan_engine.discovered_cameras:
                 first_lan = next(iter(lan_engine.discovered_cameras.values()))
                 with self.lock:
-                    if not self.camera:
-                        self.camera = first_lan.id
+                    self.camera = first_lan.id
                 return None, first_lan.id
 
         try:
             g = self.gateway()
-            cs = self.cameras(g)
+            cs = self.cameras(g, force_refresh=True)
             if cs:
                 cid = cs[0].id
                 with self.lock:
-                    if not self.camera:
-                        self.camera = cid
+                    self.camera = cid
                 return g, cid
         except Exception as e:
-            logger.warning(f"[resolve_camera] Could not list cameras ({e})")
+            logger.warning(f"[resolve_camera] Could not list cameras after automatic discovery ({e})")
 
         fallback_cid = os.getenv("CAMXPOSED_DEFAULT_CAMERA_ID", "").strip()
         if fallback_cid:
             return None, fallback_cid
-        raise RuntimeError("No camera discovered or configured. Specify camera_id or verify LAN discovery.")
+        raise RuntimeError("No camera discovered. Automatic ONVIF discovery and CamXposed gateway discovery both failed.")
 
     def connect(self,g,cid):
         cid_str = str(cid)
