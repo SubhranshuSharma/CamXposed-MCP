@@ -1437,16 +1437,18 @@ def camera_ptz(
     - capabilities: advertised PTZ ranges and supported spaces.
 
     POST-MOVEMENT IMAGE CONTRACT:
-    - For move actions, return_image defaults to True and the tool returns a
-      fresh JPEG image captured only after the movement has ended and the view
-      has settled. Inspect this image before issuing another movement.
+    - For move and relative_move actions, return_image defaults to True and
+      the tool returns a fresh JPEG image only after movement has ended and
+      the view has settled. Inspect this image before issuing another move.
     - Set return_image=False when speed matters more than visual feedback or
       when chaining deliberate movements without intermediate images.
-    - The returned image is part of this tool result; do not call camera_observe
+    - image_width controls the returned image width (120-1280; default 800).
+    - The image is included in this tool result; do not call camera_observe
       just to obtain the frame from this movement.
-    - When a target is visible but off-centre, make another small correction
-      toward the frame centre, inspect the next returned image, and stop once
-      the target is comfortably centred and fully visible.
+    - For visual search/framing, keep correcting while the target is near an
+      edge or partly out of frame. Use smaller corrections as it approaches
+      the middle; stop when the target is fully visible and comfortably
+      centred. Do not continue moving after that.
     - If image capture fails, the movement result is still returned with
       imageCaptured=false and imageError.
 
