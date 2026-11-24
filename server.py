@@ -197,6 +197,8 @@ class Client:
         # Per-camera monotonic deadline for the most recent timed PTZ movement.
         self.ptz_move_until = {}
         self.ptz_state_lock = threading.Lock()
+        self.camera_operation_locks: dict[str, threading.RLock] = {}
+        self.camera_operation_locks_guard = threading.Lock()
         self.playback_seq = int(time.time() * 1000)
         self.speak_lock = threading.Lock()
         self.stop_requested = threading.Event()
@@ -215,6 +217,16 @@ class Client:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.config_file = self.config_dir / "speaker_settings.json"
         self.local_speaker_volume_percent: int = self._load_speaker_volume()
+
+    def camera_operation_lock(self, camera_id: str) -> threading.RLock:
+        """Return a stable per-camera lock shared by PTZ and snapshot operations."""
+        key = str(camera_id)
+        with self.camera_operation_locks_guard:
+            lock = self.camera_operation_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self.camera_operation_locks[key] = lock
+            return lock
 
     def _load_speaker_volume(self) -> int:
         # Check environment variable first
@@ -1280,23 +1292,24 @@ def camera_observe(camera_id:Optional[str]=None,width:int=800,latest_frame:bool=
 
 CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
     g, cid = client.resolve_camera(camera_id)
-    try: client.connect(g, cid)
-    except Exception: pass
-    waited_ms = 0
-    if not latest_frame:
-        with client.ptz_state_lock:
-            move_until = client.ptz_move_until.get(cid, 0.0)
-        delay = max(0.0, move_until - time.monotonic()) + 0.4
-        if delay > 0:
-            logger.info(f"[camera_observe] Camera {cid} is in motion/settling; waiting {delay:.2f}s before capture...")
-            time.sleep(delay)
-            waited_ms = int(delay * 1000)
-    # Allow lightweight downscaling (down to 120px) to conserve LLM context tokens and bandwidth
-    target_width = max(120, min(int(width), 1280)) if width else 640
-    logger.info(f"[camera_observe] Capturing frame for camera {cid} (waited_ms={waited_ms}, width={target_width})...")
-    frame_bytes = client.observe(g, cid, target_width)
-    logger.info(f"[camera_observe] Returning native JPEG image ({len(frame_bytes)} bytes)")
-    return Image(data=frame_bytes, format="jpeg")
+    with client.camera_operation_lock(cid):
+        try: client.connect(g, cid)
+        except Exception: pass
+        waited_ms = 0
+        if not latest_frame:
+            with client.ptz_state_lock:
+                move_until = client.ptz_move_until.get(cid, 0.0)
+            delay = max(0.0, move_until - time.monotonic()) + 0.4
+            if delay > 0:
+                logger.info(f"[camera_observe] Camera {cid} is in motion/settling; waiting {delay:.2f}s before capture...")
+                time.sleep(delay)
+                waited_ms = int(delay * 1000)
+        # Allow lightweight downscaling (down to 120px) to conserve LLM context tokens and bandwidth
+        target_width = max(120, min(int(width), 1280)) if width else 640
+        logger.info(f"[camera_observe] Capturing frame for camera {cid} (waited_ms={waited_ms}, width={target_width})...")
+        frame_bytes = client.observe(g, cid, target_width)
+        logger.info(f"[camera_observe] Returning native JPEG image ({len(frame_bytes)} bytes)")
+        return Image(data=frame_bytes, format="jpeg")
 
 @mcp.tool()
 def camera_listen(camera_id:Optional[str]=None,seconds:float=2):
@@ -1311,7 +1324,7 @@ CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; other
     logger.info(f"[camera_listen] Done listening to camera {cid}")
     return res
 
-def camera_move(camera_id:Optional[str]=None,direction:str="right",speed:int=8,duration_ms:int=700,wait:bool=True):
+def camera_move(camera_id:Optional[str]=None,direction:str="right",speed:int=8,duration_ms:int=700,wait:bool=True,return_image:bool=True,width:int=800):
     """Perform one manual PTZ move on the camera.
 
     SPEED & DURATION WARNING:
@@ -1349,25 +1362,56 @@ CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; other
     try: client.connect(g, cid)
     except Exception: pass
 
-    logger.info(f"[camera_move] Moving camera {cid}: direction={direction}, speed={speed}, duration_ms={duration_ms}")
-    move_started = time.monotonic()
-    result = client.move(g, cid, direction, speed, duration_ms)
-    # Record deadline from request start so a bridge that already waits for the
-    # movement duration does not cause a second full-duration wait.
-    with client.ptz_state_lock:
-        if direction == "stop":
-            client.ptz_move_until[cid] = time.monotonic()
-        else:
-            client.ptz_move_until[cid] = move_started + duration_ms / 1000.0
+    logger.info(f"[camera_move] Moving camera {cid}: direction={direction}, speed={speed}, duration_ms={duration_ms}, return_image={return_image}")
+    with client.camera_operation_lock(cid):
+        move_started = time.monotonic()
+        result = client.move(g, cid, direction, speed, duration_ms)
+        # Record deadline from request start so a bridge that already waits for the
+        # movement duration does not cause a second full-duration wait.
+        with client.ptz_state_lock:
+            if direction == "stop":
+                client.ptz_move_until[cid] = time.monotonic()
+            else:
+                client.ptz_move_until[cid] = move_started + duration_ms / 1000.0
 
-    if wait and direction != "stop":
-        # Sleep for duration + 300ms mechanical settling so camera physically finishes moving
-        settle_time = (duration_ms / 1000.0) + 0.3
-        time.sleep(settle_time)
-        result["settled"] = True
+        if wait and direction != "stop":
+            # Wait for the commanded duration plus mechanical settling.
+            settle_time = max(0.0, move_started + duration_ms / 1000.0 - time.monotonic()) + 0.4
+            time.sleep(settle_time)
+            result["settled"] = True
 
-    logger.info(f"[camera_move] PTZ completed: {result}. Settled.")
-    return result
+        if return_image:
+            try:
+                # Capture directly while holding the per-camera lock. This guarantees
+                # the image belongs to the completed move and cannot race another PTZ.
+                if direction == "stop":
+                    time.sleep(0.4)
+                frame_width = max(120, min(int(width), 1280)) if width else 800
+                frame_bytes = client.observe(g, cid, frame_width)
+                captured_at = time.time()
+                logger.info(f"[camera_move] Returning post-move image ({len(frame_bytes)} bytes)")
+                return [
+                    TextContent(type="text", text=json.dumps({
+                        **result,
+                        "imageCaptured": True,
+                        "imageCapturedAt": captured_at,
+                        "imageWidth": frame_width,
+                        "imageFreshness": "captured_after_movement_and_settling"
+                    }, ensure_ascii=False)),
+                    Image(data=frame_bytes, format="jpeg")
+                ]
+            except Exception as exc:
+                logger.warning(f"[camera_move] Movement succeeded but post-move snapshot failed: {exc}")
+                return [
+                    TextContent(type="text", text=json.dumps({
+                        **result,
+                        "imageCaptured": False,
+                        "imageError": str(exc)
+                    }, ensure_ascii=False))
+                ]
+
+        logger.info(f"[camera_move] PTZ completed: {result}.")
+        return result
 
 @mcp.tool()
 def camera_ptz(
@@ -1380,6 +1424,8 @@ def camera_ptz(
     x: float = 0.0,
     y: float = 0.0,
     zoom: float = 0.0,
+    return_image: bool = True,
+    image_width: int = 800,
 ):
     """Unified local-first PTZ control.
 
@@ -1389,15 +1435,51 @@ def camera_ptz(
     - status: current position and IDLE/MOVING state.
     - capabilities: advertised PTZ ranges and supported spaces.
 
+    POST-MOVEMENT IMAGE CONTRACT:
+    - For move actions, return_image defaults to True and the tool returns a
+      fresh JPEG image captured only after the movement has ended and the view
+      has settled. Inspect this image before issuing another movement.
+    - Set return_image=False when speed matters more than visual feedback or
+      when chaining deliberate movements without intermediate images.
+    - The returned image is part of this tool result; do not call camera_observe
+      just to obtain the frame from this movement.
+    - When a target is visible but off-centre, make another small correction
+      toward the frame centre, inspect the next returned image, and stop once
+      the target is comfortably centred and fully visible.
+    - If image capture fails, the movement result is still returned with
+      imageCaptured=false and imageError.
+
     Uses the native LAN ONVIF camera directly whenever available. The Android
     bridge is only a fallback for bridge-managed cameras. Camera selection and
     discovery are automatic; do not call discovery or selection first.
     """
     op = str(action or "move").strip().lower()
     if op == "move":
-        return camera_move(camera_id, direction, speed, duration_ms, wait)
+        return camera_move(camera_id, direction, speed, duration_ms, wait, return_image, image_width)
     if op == "relative_move":
-        return camera_ptz_relative_move(camera_id, x, y, zoom, speed, wait)
+        result = camera_ptz_relative_move(camera_id, x, y, zoom, speed, wait)
+        if not return_image:
+            return result
+        g, cid = client.resolve_camera(camera_id)
+        with client.camera_operation_lock(cid):
+            try:
+                time.sleep(0.4)
+                frame_width = max(120, min(int(image_width), 1280)) if image_width else 800
+                frame_bytes = client.observe(g, cid, frame_width)
+                return [
+                    TextContent(type="text", text=json.dumps({
+                        **result,
+                        "imageCaptured": True,
+                        "imageCapturedAt": time.time(),
+                        "imageWidth": frame_width,
+                        "imageFreshness": "captured_after_movement_and_settling"
+                    }, ensure_ascii=False)),
+                    Image(data=frame_bytes, format="jpeg")
+                ]
+            except Exception as exc:
+                return [TextContent(type="text", text=json.dumps({
+                    **result, "imageCaptured": False, "imageError": str(exc)
+                }, ensure_ascii=False))]
     if op == "status":
         return camera_ptz_status(camera_id)
     if op == "capabilities":
