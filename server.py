@@ -1374,8 +1374,9 @@ CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; other
             else:
                 client.ptz_move_until[cid] = move_started + duration_ms / 1000.0
 
-        if wait and direction != "stop":
-            # Wait for the commanded duration plus mechanical settling.
+        if (wait or return_image) and direction != "stop":
+            # An image-bearing PTZ call must always wait for movement completion,
+            # even when the caller disables the normal wait behavior.
             settle_time = max(0.0, move_started + duration_ms / 1000.0 - time.monotonic()) + 0.4
             time.sleep(settle_time)
             result["settled"] = True
@@ -1457,11 +1458,12 @@ def camera_ptz(
     if op == "move":
         return camera_move(camera_id, direction, speed, duration_ms, wait, return_image, image_width)
     if op == "relative_move":
-        result = camera_ptz_relative_move(camera_id, x, y, zoom, speed, wait)
-        if not return_image:
-            return result
         g, cid = client.resolve_camera(camera_id)
+        # Serialize the relative move and its follow-up frame as one operation.
         with client.camera_operation_lock(cid):
+            result = camera_ptz_relative_move(camera_id, x, y, zoom, speed, wait or return_image)
+            if not return_image:
+                return result
             try:
                 time.sleep(0.4)
                 frame_width = max(120, min(int(image_width), 1280)) if image_width else 800
