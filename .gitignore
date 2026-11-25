@@ -17,6 +17,9 @@ ENV/
 *.key
 *.pem
 *.token
+*.db
+*.sqlite
+*.sqlite3
 ngrok.yml
 
 # Logs & PID files

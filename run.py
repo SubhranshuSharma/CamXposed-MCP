@@ -7,12 +7,15 @@ import importlib.util
 import json
 import os
 import platform
+import re
+import select
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -200,8 +203,10 @@ def child_parent_death_signal():
     return configure
 
 
-def start_server(port: int):
+def start_server(port: int, hide_voice_tools: bool = False):
     env = python_env()
+    if hide_voice_tools:
+        env["CAMXPOSED_HIDE_VOICE_TOOLS"] = "1"
     log = open(SERVER_LOG, "a", encoding="utf-8")
     command = [
         sys.executable, str(ROOT / "server.py"),
@@ -231,9 +236,98 @@ def wait_for_server(proc, port: int, timeout: float = 25.0) -> bool:
     return False
 
 
+def is_gateway_running(gateway_url: str = "http://127.0.0.1:8090") -> bool:
+    """Checks if the local ChatGPT Web Voice Go gateway is alive and responding."""
+    try:
+        req = urllib.request.Request(f"{gateway_url.rstrip('/')}/api/auth/login", method="POST")
+        with urllib.request.urlopen(req, timeout=1.5):
+            return True
+    except urllib.error.HTTPError as err:
+        # 400 Bad Request or 401 Unauthorized confirms the Go gateway is alive!
+        if err.code in (400, 401, 405, 422):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def start_voice_gateway():
+    """Locates and starts the Go voice gateway binary if not already running."""
+    if is_gateway_running():
+        say("✓ Local voice gateway is already running on http://127.0.0.1:8090")
+        return None, None
+
+    # Search candidates for the chatgpt-web-voice repository
+    gw_env_dir = os.getenv("VOICE_GATEWAY_DIR", "").strip()
+    candidates = []
+    if gw_env_dir:
+        candidates.append(Path(gw_env_dir))
+    candidates.extend([
+        ROOT.parent / "chatgpt-web-voice",
+        Path.home() / "chatgpt-web-voice",
+        Path.home() / "Documents/chatgpt-web-voice",
+        Path.home() / "Documents/antigravity/lively-bardeen/chatgpt-web-voice",
+        Path.home() / "Downloads/chatgpt-web-voice",
+    ])
+    gw_dir = next((d for d in candidates if (d / "bin/server").is_file()), None)
+
+    if not gw_dir:
+        say("! Voice gateway binary not found in standard paths; skipping gateway auto-start")
+        return None, None
+
+    say(f"--- Starting Local Voice Gateway ({gw_dir.name}) ---")
+    log_path = LOG_DIR / "gateway.log"
+    log = open(log_path, "a", encoding="utf-8")
+
+    # Load environment from .env if present
+    gw_env = os.environ.copy()
+    env_file = gw_dir / ".env"
+    if env_file.is_file():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    gw_env[k.strip()] = v.strip().strip("'\"")
+        except Exception as e:
+            say(f"! Warning reading {env_file}: {e}")
+
+    cmd = [str(gw_dir / "bin/server")]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(gw_dir),
+        env=gw_env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        preexec_fn=child_parent_death_signal()
+    )
+
+    # Wait up to 10s for the gateway to become responsive
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            say(f"! Voice gateway failed to start; inspect {log_path}")
+            return None, log
+        if is_gateway_running():
+            say("✓ Voice gateway is healthy on http://127.0.0.1:8090")
+            return proc, log
+        time.sleep(0.3)
+
+    say(f"! Voice gateway startup timed out; inspect {log_path}")
+    return proc, log
+
+
 def start_ngrok(port: int, *, change_token: bool = False):
     token = get_ngrok_token(change=change_token)
     ngrok = shutil.which("ngrok")
+
+    # Terminate any lingering or orphaned ngrok tunnel processes to avoid ERR_NGROK_334
+    try:
+        subprocess.run(["pkill", "-f", "ngrok http"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.6)
+    except Exception:
+        pass
 
     # Native ngrok CLI can reuse an existing `ngrok config add-authtoken`
     # configuration, so do not force a second token prompt on desktop Linux.
@@ -367,17 +461,101 @@ def acquire_instance_lock():
     return handle
 
 
+def select_camera_via_ws_discovery() -> str:
+    """Discovers ONVIF cameras via WS-Discovery, filters for actual cameras, and prompts user in CLI."""
+    from lan_engine import LanEngine
+    say("\n--- Discovering ONVIF Cameras via WS-Discovery ---")
+    say("Scanning LAN (UDP 3702) for verified ONVIF cameras...")
+    engine = LanEngine()
+    res = engine.discover_all(timeout=2.0)
+    cams = [c for c in res.get("cameras", []) if isinstance(c, dict) and c.get("ip")]
+
+    if not cams:
+        fallback_ip = os.getenv("CAMXPOSED_CAMERA_IP", "10.195.38.213")
+        say(f"! No verified ONVIF cameras found via WS-Discovery. Falling back to: {fallback_ip}")
+        return fallback_ip
+
+    say(f"Found {len(cams)} verified ONVIF camera(s):")
+    for idx, cam in enumerate(cams, 1):
+        ptz_info = " [PTZ Supported]" if cam.get("ptzSupported") else ""
+        say(f"  [{idx}] {cam.get('name', 'Camera')} - IP: {cam.get('ip')}{ptz_info}")
+
+    default_cam = cams[0]
+    default_ip = default_cam["ip"]
+
+    if len(cams) == 1:
+        say(f"Default camera: [{1}] {default_cam.get('name')} ({default_ip})")
+
+    if sys.stdin.isatty():
+        try:
+            prompt = f"\nSelect camera [1-{len(cams)}] or enter custom IP (press Enter or wait 5s for default: 1 [ {default_ip} ]): "
+            user_choice = None
+
+            def _get_input():
+                nonlocal user_choice
+                try:
+                    user_choice = input(prompt).strip()
+                except (EOFError, KeyboardInterrupt):
+                    user_choice = ""
+
+            t = threading.Thread(target=_get_input, daemon=True)
+            t.start()
+            t.join(timeout=5.0)
+
+            if user_choice is None:
+                sys.stdout.write(f"\n[Timeout 5s] Auto-selecting default camera [{default_ip}]\n")
+                sys.stdout.flush()
+                user_choice = ""
+
+            if not user_choice:
+                chosen_ip = default_ip
+            elif user_choice.isdigit() and 1 <= int(user_choice) <= len(cams):
+                chosen_ip = cams[int(user_choice) - 1]["ip"]
+            elif re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", user_choice):
+                chosen_ip = user_choice
+            else:
+                say(f"Invalid input '{user_choice}'; using default camera [{default_ip}]")
+                chosen_ip = default_ip
+        except (EOFError, KeyboardInterrupt):
+            say(f"\nUsing default camera [{default_ip}]")
+            chosen_ip = default_ip
+    else:
+        say(f"Auto-selected default camera: [{default_ip}]")
+        chosen_ip = default_ip
+
+    say(f"✓ Target Camera: {chosen_ip}\n")
+    return chosen_ip
+
+
 def main() -> int:
-    change_token = "--change-token" in sys.argv[1:]
-    if change_token:
-        sys.argv.remove("--change-token")
+    import argparse
+    parser = argparse.ArgumentParser(description="CamXposed MCP Launcher with ChatGPT Live Voice Bridge")
+    parser.add_argument("--mode", choices=["mcp", "live", "both"], default=os.getenv("CAMXPOSED_MODE", "both"),
+                        help="Operating mode: 'mcp' (standard MCP server only), 'live' (direct ChatGPT Live voice bridge only), or 'both' (default: full live voice experience with camera MCP tools).")
+    parser.add_argument("--change-token", action="store_true", help="Prompt to change saved ngrok authtoken")
+    parser.add_argument("--camera-ip", default=os.getenv("CAMXPOSED_CAMERA_IP", None),
+                        help="Target camera LAN IP address (auto-discovered via WS-Discovery if omitted)")
+    parser.add_argument("--token", default=os.getenv("CAMXPOSED_CHATGPT_TOKEN"),
+                        help="ChatGPT access token / session token (auto-extracted from Firefox if omitted)")
+    parser.add_argument("--account-email", default=os.getenv("CAMXPOSED_ACCOUNT_EMAIL"),
+                        help="ChatGPT account email to use (prompts user to select from discovered Firefox accounts if omitted)")
+    parser.add_argument("--voice", default=os.getenv("CAMXPOSED_VOICE", "cove"),
+                        help="ChatGPT voice name: cove, breeze, ember, juniper, vale (default: cove)")
+    parser.add_argument("--motion-cooldown", type=float, default=float(os.getenv("CAMXPOSED_MOTION_COOLDOWN_S", "4.0")),
+                        help="Cooldown in seconds after camera movement to suppress false-positive motion alarms (default: 4.0)")
+    args, _ = parser.parse_known_args()
+    os.environ["CAMXPOSED_MOTION_COOLDOWN_S"] = str(args.motion_cooldown)
+
+    change_token = args.change_token
+    mode = args.mode
+
     if sys.version_info < (3, 10):
         raise RuntimeError("CamXposed MCP requires Python 3.10 or newer.")
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg is missing. Install it first (Linux: apt install ffmpeg; Termux: pkg install ffmpeg).")
 
     platform_name = "Termux" if is_termux() else "Linux"
-    say(f"CamXposed MCP launcher — {platform_name}")
+    say(f"CamXposed MCP launcher — {platform_name} [Mode: {mode.upper()}]")
     lock_handle = acquire_instance_lock()
 
     # Convert SIGTERM into normal Python unwinding so finally always cleans
@@ -388,64 +566,135 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_sigterm)
     ensure_python_dependencies()
 
-    server_proc = tunnel_proc = None
-    server_log = tunnel_log = None
-    try:
-        port = None
-        for candidate in range(PREFERRED_PORT, PREFERRED_PORT + PORT_SCAN_COUNT):
-            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                probe.bind((HOST, candidate))
-            except OSError:
-                continue
-            finally:
-                probe.close()
-            say(f"Starting local MCP server at http://{HOST}:{candidate}/mcp ...")
-            server_proc, server_log = start_server(candidate)
-            if wait_for_server(server_proc, candidate):
-                port = candidate
-                break
-            stop_process(server_proc)
-            server_proc = None
-        if port is None:
-            raise RuntimeError(
-                f"No available MCP port in {PREFERRED_PORT}-{PREFERRED_PORT + PORT_SCAN_COUNT - 1}. "
-                f"Check {SERVER_LOG}"
-            )
-        say(f"✓ Local MCP server is healthy on port {port}")
+    target_camera_ip = args.camera_ip
+    if not target_camera_ip:
+        target_camera_ip = select_camera_via_ws_discovery()
+    os.environ["CAMXPOSED_CAMERA_IP"] = target_camera_ip
 
-        say("Connecting ngrok remote tunnel...")
-        tunnel_proc, tunnel_log, public_url = start_ngrok(port, change_token=change_token)
-        endpoint = public_url + "/mcp"
-        say("Checking the public MCP endpoint...")
-        if verify_remote_endpoint(endpoint):
-            say("✓ Remote MCP handshake succeeded")
-        else:
-            say("! Tunnel is active, but the remote MCP handshake timed out; check the logs")
-        say("")
-        say("CAMXPOSED MCP IS READY")
-        say(f"Remote MCP endpoint: {endpoint}")
-        say(f"Local endpoint:      http://{HOST}:{port}/mcp")
-        say(f"Server log:          {SERVER_LOG}")
-        say(f"Tunnel log:          {TUNNEL_LOG}")
-        say("Keep this process running. Press Ctrl+C to stop both services.")
+    target_token = args.token
+    target_account_email = args.account_email
+    if mode in ("live", "both") and not target_token:
+        try:
+            from live_voice_bridge import select_chatgpt_account
+            chosen = select_chatgpt_account()
+            if chosen:
+                target_token = chosen.get("access_token")
+                target_account_email = chosen.get("email")
+        except Exception as e:
+            say(f"! Account selection error: {e}; falling back to default discovery")
+
+    hide_voice_tools = (mode == "live")
+    gateway_proc = None
+    gateway_log = None
+    bridge_proc = None
+    tunnel_proc = None
+    server_proc = None
+    bridge_log = None
+    tunnel_log = None
+    server_log = None
+
+    try:
+        # 1. Start Go Voice Gateway if mode is 'live' or 'both'
+        if mode in ("live", "both"):
+            gateway_proc, gateway_log = start_voice_gateway()
+
+        # 2. Start Live Voice Bridge if mode is 'live' or 'both'
+        if mode in ("live", "both"):
+            say("\n--- Starting ChatGPT Live Voice Bridge ---")
+            say(f"Target Camera IP: {target_camera_ip}")
+            say(f"ChatGPT Voice:    {args.voice}")
+            if target_account_email:
+                say(f"ChatGPT Account:  {target_account_email}")
+            say("Direct connection: Camera RTSP Mic -> ChatGPT WebRTC -> Camera TCP 28772 Speaker")
+            
+            bridge_log_path = LOG_DIR / "bridge.log"
+            bridge_log = open(bridge_log_path, "a", encoding="utf-8")
+            bridge_cmd = [
+                sys.executable, str(ROOT / "live_voice_bridge.py"),
+                "--camera-ip", target_camera_ip,
+                "--voice", args.voice,
+            ]
+            if target_token:
+                bridge_cmd.extend(["--token", target_token])
+            if target_account_email:
+                bridge_cmd.extend(["--account-email", target_account_email])
+            if args.motion_cooldown is not None:
+                bridge_cmd.extend(["--motion-cooldown", str(args.motion_cooldown)])
+
+            env = python_env()
+            bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT, env=env, stdout=bridge_log, stderr=subprocess.STDOUT,
+                                           start_new_session=True, preexec_fn=child_parent_death_signal())
+            say(f"✓ Live Voice Bridge process running (logs: {bridge_log_path})")
+
+        # 2. Start MCP server and tunnel if mode is 'mcp' or 'both'
+        if mode in ("mcp", "both"):
+            say(f"\n--- Starting CamXposed MCP Server (Hide voice tools: {hide_voice_tools}) ---")
+            port = None
+            for candidate in range(PREFERRED_PORT, PREFERRED_PORT + PORT_SCAN_COUNT):
+                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    probe.bind((HOST, candidate))
+                except OSError:
+                    continue
+                finally:
+                    probe.close()
+                say(f"Starting local MCP server at http://{HOST}:{candidate}/mcp ...")
+                server_proc, server_log = start_server(candidate, hide_voice_tools=hide_voice_tools)
+                if wait_for_server(server_proc, candidate):
+                    port = candidate
+                    break
+                stop_process(server_proc)
+                server_proc = None
+            if port is None:
+                raise RuntimeError(
+                    f"No available MCP port in {PREFERRED_PORT}-{PREFERRED_PORT + PORT_SCAN_COUNT - 1}. "
+                    f"Check {SERVER_LOG}"
+                )
+            say(f"✓ Local MCP server is healthy on port {port}")
+
+            say("Connecting ngrok remote tunnel...")
+            tunnel_proc, tunnel_log, public_url = start_ngrok(port, change_token=change_token)
+            endpoint = public_url + "/mcp"
+            say("Checking the public MCP endpoint...")
+            if verify_remote_endpoint(endpoint):
+                say("✓ Remote MCP handshake succeeded")
+            else:
+                say("! Tunnel is active, but the remote MCP handshake timed out; check the logs")
+            say("")
+            say("CAMXPOSED MCP IS READY")
+            say(f"Remote MCP endpoint: {endpoint}")
+            say(f"Local endpoint:      http://{HOST}:{port}/mcp")
+            say(f"Server log:          {SERVER_LOG}")
+            say(f"Tunnel log:          {TUNNEL_LOG}")
+
+        say("\nAll services started. Keep this process running. Press Ctrl+C to stop.")
 
         while True:
-            if server_proc.poll() is not None:
+            if server_proc and server_proc.poll() is not None:
                 raise RuntimeError(f"MCP server exited; inspect {SERVER_LOG}")
-            if tunnel_proc.poll() is not None:
+            if tunnel_proc and tunnel_proc.poll() is not None:
                 raise RuntimeError(f"ngrok tunnel exited; inspect {TUNNEL_LOG}")
+            if bridge_proc and bridge_proc.poll() is not None:
+                raise RuntimeError(f"Live voice bridge exited; inspect {LOG_DIR / 'bridge.log'}")
+            if gateway_proc and gateway_proc.poll() is not None:
+                raise RuntimeError(f"Voice gateway exited; inspect {LOG_DIR / 'gateway.log'}")
             time.sleep(1)
     except KeyboardInterrupt:
-        say("\nStopping MCP server and tunnel...")
+        say("\nStopping all services...")
         return 0
     finally:
+        stop_process(bridge_proc)
         stop_process(tunnel_proc)
         stop_process(server_proc)
+        stop_process(gateway_proc)
+        if bridge_log:
+            bridge_log.close()
         if tunnel_log:
             tunnel_log.close()
         if server_log:
             server_log.close()
+        if gateway_log:
+            gateway_log.close()
         lock_handle.close()
 
 

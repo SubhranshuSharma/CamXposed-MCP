@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -30,9 +32,64 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("camxposed.lan")
+
+def _get_local_ipv4_addresses() -> list[str]:
+    """Enumerates all non-loopback IPv4 addresses across network interfaces."""
+    addrs: set[str] = set()
+    try:
+        import ifaddr
+        for iface in ifaddr.get_adapters():
+            for ip in iface.ips:
+                if isinstance(ip.ip, str):
+                    try:
+                        parsed = ipaddress.ip_address(ip.ip)
+                        if not parsed.is_loopback and not parsed.is_link_local:
+                            addrs.add(ip.ip)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if not addrs:
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                ip = info[4][0]
+                if not ip.startswith("127."):
+                    addrs.add(ip)
+        except Exception:
+            pass
+
+    return list(addrs)
+
+DEFAULT_MOTION_COOLDOWN_AFTER_MOVE_S = float(os.getenv("CAMXPOSED_MOTION_COOLDOWN_S", "4.0"))
+
+def _movement_state_file() -> Path:
+    log_dir = Path(os.getenv("CAMXPOSED_LOG_DIR", str(Path(tempfile.gettempdir()) / "camxposed-mcp")))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "camera_movement.json"
+
+def _session_state_file() -> Path:
+    log_dir = Path(os.getenv("CAMXPOSED_LOG_DIR", str(Path(tempfile.gettempdir()) / "camxposed-mcp")))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "session_state.json"
+
+def _normalize_cam_keys(cam_key: str) -> list[str]:
+    """Returns normalized representations (both IP and ID) for a camera identifier."""
+    raw = str(cam_key).strip()
+    keys = {raw}
+    if raw.startswith("lan_"):
+        ip_part = raw[4:].replace("_", ".")
+        keys.add(ip_part)
+    elif "." in raw:
+        id_part = "lan_" + raw.replace(".", "_")
+        keys.add(id_part)
+    return list(keys)
+
 
 WS_DISCOVERY_ADDR = ("239.255.255.250", 3702)
 SSDP_ADDR = ("239.255.255.250", 1900)
@@ -46,6 +103,7 @@ class LanCamera:
     device_service_url: str = ""
     media_service_url: str = ""
     ptz_service_url: str = ""
+    events_service_url: str = ""
     snapshot_url: str = ""
     stream_uri: str = ""
     username: str = "admin"
@@ -77,7 +135,253 @@ class LanEngine:
         self.discovered_cameras: dict[str, LanCamera] = {}
         self.discovered_gateways: dict[str, dict[str, Any]] = {}
         self.ptz_move_states: dict[str, dict[str, Any]] = {}
+        self._movement_records: dict[str, dict[str, Any]] = {}
+        self._live_session_active: bool = False
+        self._alerts_enabled: bool = False
+        self._agent_working: bool = False
+        self._last_agent_done_time: float = 0.0
         self.last_scan_time: float = 0.0
+
+    def record_camera_movement(self, cam_key: str, duration_ms: int = 800, cooldown_s: Optional[float] = None) -> None:
+        """Records camera movement start, end, and post-movement settling cooldown."""
+        if cooldown_s is None:
+            cooldown_s = DEFAULT_MOTION_COOLDOWN_AFTER_MOVE_S
+        now = time.time()
+        move_until = now + (max(0, duration_ms) / 1000.0)
+        cooldown_until = move_until + max(0.0, cooldown_s)
+
+        record = {
+            "move_start": now,
+            "move_until": move_until,
+            "cooldown_until": cooldown_until,
+            "cooldown_s": cooldown_s,
+            "duration_ms": duration_ms,
+        }
+
+        with self.lock:
+            for k in _normalize_cam_keys(cam_key):
+                self._movement_records[k] = record
+
+        # Persist to shared file so other processes (live bridge, server) share movement state
+        try:
+            filepath = _movement_state_file()
+            state = {}
+            if filepath.exists():
+                try:
+                    state = json.loads(filepath.read_text(encoding="utf-8"))
+                except Exception:
+                    state = {}
+            for k in _normalize_cam_keys(cam_key):
+                state[k] = record
+            tmp_path = filepath.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+            tmp_path.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(tmp_path, filepath)
+            logger.debug(f"[record_camera_movement] Camera {cam_key} moving for {duration_ms}ms + {cooldown_s}s settling cooldown")
+        except Exception as e:
+            logger.debug(f"[record_camera_movement] Failed to persist movement state: {e}")
+
+    def set_live_session_state(self, is_active: bool, alerts_enabled: bool = False, camera_ip: str = "") -> None:
+        """Sets the live voice bridge session state and alert enablement across processes."""
+        with self.lock:
+            self._live_session_active = is_active
+            self._alerts_enabled = alerts_enabled
+        try:
+            filepath = _session_state_file()
+            state = {}
+            if filepath.exists():
+                try:
+                    state = json.loads(filepath.read_text(encoding="utf-8"))
+                except Exception:
+                    state = {}
+            state["is_live_active"] = is_active
+            state["alerts_enabled"] = alerts_enabled
+            if camera_ip:
+                state["camera_ip"] = camera_ip
+            state["updated_at"] = time.time()
+            tmp_path = filepath.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+            tmp_path.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(tmp_path, filepath)
+            logger.info(f"[SessionState] Updated: live_active={is_active}, alerts_enabled={alerts_enabled}")
+        except Exception as e:
+            logger.debug(f"[set_live_session_state] Failed to persist session state: {e}")
+
+    def is_live_session_active(self) -> bool:
+        """Returns True if the camera is currently connected to ChatGPT live voice session."""
+        try:
+            filepath = _session_state_file()
+            if filepath.exists():
+                state = json.loads(filepath.read_text(encoding="utf-8"))
+                if (time.time() - state.get("updated_at", 0.0)) < 120.0:
+                    return bool(state.get("is_live_active", False))
+        except Exception:
+            pass
+        with self.lock:
+            return self._live_session_active
+
+    def are_alerts_enabled(self) -> bool:
+        """Returns True ONLY when alerts are explicitly enabled (e.g. in Standby mode).
+        Returns False all the while camera is active and connection is idle.
+        """
+        try:
+            filepath = _session_state_file()
+            if filepath.exists():
+                state = json.loads(filepath.read_text(encoding="utf-8"))
+                if (time.time() - state.get("updated_at", 0.0)) < 120.0:
+                    return bool(state.get("alerts_enabled", False))
+        except Exception:
+            pass
+        with self.lock:
+            return self._alerts_enabled
+
+    def record_agent_working(self, is_working: bool, detail: str = "") -> None:
+        """Records whether the AI agent / MCP tool is actively executing work."""
+        now = time.time()
+        with self.lock:
+            self._agent_working = is_working
+            if not is_working:
+                self._last_agent_done_time = now
+        try:
+            filepath = _session_state_file()
+            state = {}
+            if filepath.exists():
+                try:
+                    state = json.loads(filepath.read_text(encoding="utf-8"))
+                except Exception:
+                    state = {}
+            state["agent_working"] = is_working
+            state["agent_detail"] = detail
+            if is_working:
+                state["last_agent_active_time"] = now
+            else:
+                state["last_agent_done_time"] = now
+            state["updated_at"] = now
+            tmp_path = filepath.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+            tmp_path.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(tmp_path, filepath)
+            logger.debug(f"[record_agent_working] Agent working={is_working} ({detail})")
+        except Exception as e:
+            logger.debug(f"[record_agent_working] Failed to persist agent state: {e}")
+
+    def is_agent_working(self) -> bool:
+        """Returns True if an agent MCP tool is currently running."""
+        try:
+            filepath = _session_state_file()
+            if filepath.exists():
+                state = json.loads(filepath.read_text(encoding="utf-8"))
+                if bool(state.get("agent_working", False)):
+                    # Guard against stale state if crashed: max tool timeout 60s
+                    if (time.time() - state.get("last_agent_active_time", 0.0)) < 60.0:
+                        return True
+        except Exception:
+            pass
+        with self.lock:
+            return self._agent_working
+
+    def get_last_agent_done_time(self) -> float:
+        """Returns the unix timestamp when the agent last finished executing."""
+        try:
+            filepath = _session_state_file()
+            if filepath.exists():
+                state = json.loads(filepath.read_text(encoding="utf-8"))
+                return float(state.get("last_agent_done_time", 0.0))
+        except Exception:
+            pass
+        with self.lock:
+            return self._last_agent_done_time
+
+    def is_camera_moving_or_cooling(self, cam_key: str, cam: Optional[LanCamera] = None, event_utc: Optional[str] = None) -> tuple[bool, float]:
+        """Returns (True, remaining_cooldown_s) if camera is currently moving or settling post-movement (during move or within 4s cooldown).
+        Checks current arrival time, hardware moving status, and event_utc timestamp.
+        """
+        now = time.time()
+        keys = _normalize_cam_keys(cam_key)
+
+        event_ts = None
+        if event_utc:
+            try:
+                from datetime import datetime
+                clean_utc = str(event_utc).strip().replace("Z", "+00:00")
+                event_ts = datetime.fromisoformat(clean_utc).timestamp()
+            except Exception:
+                event_ts = None
+
+        def _is_record_active(rec: Optional[dict[str, Any]]) -> tuple[bool, float]:
+            if not rec:
+                return False, 0.0
+            move_start = rec.get("move_start", 0.0)
+            cooldown_until = rec.get("cooldown_until", 0.0)
+            # 1. Current clock check (event arrived while moving or within 4s cooldown)
+            if now < cooldown_until:
+                return True, max(0.0, cooldown_until - now)
+            # 2. Event generation timestamp check (in case camera buffered event and delivered it slightly later)
+            if event_ts is not None and abs(event_ts - now) < 86400:
+                if (move_start - 0.5) <= event_ts <= (cooldown_until + 0.5):
+                    return True, max(0.0, cooldown_until - now)
+            return False, 0.0
+
+        # 1. Check local cache first
+        with self.lock:
+            for k in keys:
+                rec = self._movement_records.get(k)
+                active, rem = _is_record_active(rec)
+                if active:
+                    return True, rem
+
+        # 2. Check shared file (if written by another process, e.g. server.py)
+        try:
+            filepath = _movement_state_file()
+            if filepath.exists():
+                state = json.loads(filepath.read_text(encoding="utf-8"))
+                for k in keys:
+                    rec = state.get(k)
+                    active, rem = _is_record_active(rec)
+                    if active:
+                        # Update local cache
+                        with self.lock:
+                            for sub_k in keys:
+                                self._movement_records[sub_k] = rec
+                        return True, rem
+        except Exception:
+            pass
+
+        # 3. Hardware check if cam object provided and ptz supported
+        if cam and getattr(cam, "ptz_supported", False):
+            try:
+                status = self.ptz_status(cam)
+                move_stat = status.get("moveStatus", {})
+                if move_stat.get("panTilt") == "MOVING" or move_stat.get("zoom") == "MOVING":
+                    # Camera hardware reports active movement; record settling
+                    self.record_camera_movement(cam.ip, duration_ms=1000)
+                    return True, DEFAULT_MOTION_COOLDOWN_AFTER_MOVE_S
+            except Exception:
+                pass
+
+        return False, 0.0
+
+    @staticmethod
+    def is_motion_event(topic: str, data: Optional[dict[str, Any]] = None) -> bool:
+        """Determines if an ONVIF event topic or payload is a video motion/detector alarm."""
+        t_low = (topic or "").lower()
+        motion_keywords = ("motion", "cellmotion", "fielddetector", "linedetector", "motionalarm", "analytics", "ruledetector")
+        if any(kw in t_low for kw in motion_keywords):
+            return True
+        if data:
+            for k in data.keys():
+                if any(kw in k.lower() for kw in ("motion", "detector")):
+                    return True
+        return False
+
+    @staticmethod
+    def is_active_alarm(data: dict[str, Any]) -> bool:
+        """Returns True if the event payload indicates an active alarm, False if cleared/inactive."""
+        if not data:
+            return True
+        for k, v in data.items():
+            v_str = str(v).lower().strip()
+            if v_str in ("false", "0", "idle", "cleared", "no_motion"):
+                return False
+        return True
+
 
     def onvif_soap(self, endpoint: str, action: str, body_xml: str, username: str = "admin", password: str = "", timeout: float = 5.0) -> tuple[int, str]:
         """Direct lightweight ONVIF SOAP caller with WS-Security UsernameToken Digest/Text support."""
@@ -118,10 +422,11 @@ class LanEngine:
             return 0, str(e)
 
     def probe_ws_discovery(self, timeout: float = 2.0) -> list[dict[str, Any]]:
-        """Perform ONVIF WS-Discovery using the Python standard library.
+        """Perform ONVIF WS-Discovery across all local network interfaces.
 
-        This deliberately avoids wsdiscovery's platform-specific multicast
-        socket behavior, which is unreliable on Android/Termux.
+        Sends probes across all local network interfaces via IP_MULTICAST_IF
+        to ensure discovery across multi-homed systems (e.g. Ethernet + Wi-Fi).
+        Falls back to the wsdiscovery library if available and no responses received.
         """
         message_id = f"urn:uuid:{uuid.uuid4()}"
         probe = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -144,7 +449,22 @@ class LanEngine:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("", 0))
             sock.settimeout(0.25)
-            sock.sendto(probe, WS_DISCOVERY_ADDR)
+
+            # Send probe on default interface
+            try:
+                sock.sendto(probe, WS_DISCOVERY_ADDR)
+            except Exception:
+                pass
+
+            # Send probe across each active local IPv4 interface
+            local_ips = _get_local_ipv4_addresses()
+            for lip in local_ips:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(lip))
+                    sock.sendto(probe, WS_DISCOVERY_ADDR)
+                except Exception as e:
+                    logger.debug(f"[probe_ws_discovery] Failed to send on interface {lip}: {e}")
+
             deadline = time.monotonic() + max(0.5, float(timeout))
             while time.monotonic() < deadline:
                 try:
@@ -186,12 +506,46 @@ class LanEngine:
             logger.warning(f"[probe_ws_discovery] Native UDP probe failed: {e}")
         finally:
             sock.close()
+
+        # Fallback to wsdiscovery library if 0 responses received
+        if not found:
+            try:
+                from wsdiscovery.discovery import ThreadedWSDiscovery as WSDiscovery
+                wsd = WSDiscovery()
+                wsd.start()
+                svcs = wsd.searchServices(timeout=max(1.5, timeout))
+                for s in svcs:
+                    xaddrs = s.getXAddrs() or []
+                    if not xaddrs:
+                        continue
+                    scopes = [str(sc) for sc in (s.getScopes() or [])]
+                    types = [str(t) for t in (s.getTypes() or [])]
+                    source_ip = ""
+                    try:
+                        u = urllib.parse.urlparse(xaddrs[0])
+                        source_ip = u.hostname or ""
+                    except Exception:
+                        pass
+                    key = (source_ip, tuple(sorted(xaddrs)))
+                    found[key] = {
+                        "epr": str(s.getEPR() or ""),
+                        "xaddrs": xaddrs,
+                        "types": types,
+                        "scopes": scopes,
+                        "isOnvif": True,
+                        "source": "wsdiscovery-lib",
+                        "sourceIp": source_ip,
+                    }
+                wsd.stop()
+            except Exception as e:
+                logger.debug(f"[probe_ws_discovery] wsdiscovery library fallback error: {e}")
+
         results = list(found.values())
-        logger.info("[probe_ws_discovery] Native UDP discovery received %d ONVIF response(s)", len(results))
+        logger.info("[probe_ws_discovery] WS-Discovery received %d ONVIF response(s)", len(results))
         return results
 
     def probe_ssdp(self, timeout: float = 1.5) -> list[dict[str, Any]]:
-        """Active UPnP SSDP M-SEARCH over UDP 1900."""
+        """Active UPnP SSDP M-SEARCH over UDP 1900 across all local interfaces."""
         msg = (
             "M-SEARCH * HTTP/1.1\r\n"
             "HOST: 239.255.255.250:1900\r\n"
@@ -208,7 +562,16 @@ class LanEngine:
             pass
         results = []
         try:
-            sock.sendto(msg, SSDP_ADDR)
+            try:
+                sock.sendto(msg, SSDP_ADDR)
+            except Exception:
+                pass
+            for lip in _get_local_ipv4_addresses():
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(lip))
+                    sock.sendto(msg, SSDP_ADDR)
+                except Exception:
+                    pass
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 try:
@@ -275,6 +638,7 @@ class LanEngine:
         # Extract Media and PTZ XAddrs
         media_url = f"http://{ip}:{port}/onvif/media"
         ptz_url = f"http://{ip}:{port}/onvif/ptz_service"
+        events_url = f"http://{ip}:{port}/onvif/event_service"
         try:
             root = ET.fromstring(cap_resp)
             for m in root.iter():
@@ -285,6 +649,9 @@ class LanEngine:
                 elif tag == "PTZ":
                     x = _xml_text(m, "XAddr")
                     if x: ptz_url = x
+                elif tag == "Events":
+                    x = _xml_text(m, "XAddr")
+                    if x: events_url = x
         except Exception as e:
             logger.warning(f"[interrogate_onvif] Cap parse error: {e}")
 
@@ -370,6 +737,7 @@ class LanEngine:
             device_service_url=device_url,
             media_service_url=media_url,
             ptz_service_url=ptz_url,
+            events_service_url=events_url,
             snapshot_url=snapshot_url,
             stream_uri=stream_uri,
             username=username,
@@ -534,6 +902,7 @@ class LanEngine:
 
         if dir_clean == "stop":
             self.stop_tracked_move(cam)
+            self.record_camera_movement(cam.ip, duration_ms=0)
             body = f"<tptz:Stop><tptz:ProfileToken>{prof}</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom></tptz:Stop>"
             st, resp = self.onvif_soap(endpoint, "http://www.onvif.org/ver20/ptz/wsdl/Stop", body, cam.username, cam.password)
             return {"ok": st < 300, "provider": "native_onvif", "action": "stop", "httpStatus": st}
@@ -566,6 +935,7 @@ class LanEngine:
         if st < 300:
             # Arm host-side independent auto-stop timer with retry to guarantee camera stops
             self._arm_auto_stop(cam, bounded_duration, speed)
+            self.record_camera_movement(cam.ip, duration_ms=bounded_duration)
 
         return {
             "ok": st < 300,
@@ -591,6 +961,7 @@ class LanEngine:
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", "tcp",
+            "-allowed_media_types", "audio",
             "-i", rtsp,
             "-vn", "-t", str(max(0.5, min(10.0, float(seconds)))),
             "-c:a", "pcm_s16le", "-f", "wav", "pipe:1"
@@ -684,6 +1055,7 @@ class LanEngine:
             state["active"] = False
 
         if send_hardware_stop and was_active:
+            self.record_camera_movement(cam.ip, duration_ms=0)
             try:
                 endpoint = cam.ptz_service_url or f"http://{cam.ip}:{cam.port}/onvif/ptz_service"
                 prof = cam.profile_token or "PROFILE_000"
@@ -734,6 +1106,7 @@ class LanEngine:
                 return
             if st < 300:
                 state["active"] = False
+                self.record_camera_movement(cam.ip, duration_ms=0)
                 logger.info(f"[ptz_move] Host-enforced ONVIF Stop succeeded for {cam.ip}")
             else:
                 logger.warning(f"[ptz_move] Host-enforced ONVIF Stop failed with HTTP {st} for {cam.ip}")
@@ -766,6 +1139,8 @@ class LanEngine:
             f"</tptz:RelativeMove>"
         )
         st, resp = self.onvif_soap(endpoint, "http://www.onvif.org/ver20/ptz/wsdl/RelativeMove", body, cam.username, cam.password)
+        if st < 300:
+            self.record_camera_movement(cam.ip, duration_ms=800)
         return {
             "ok": st < 300,
             "provider": "native_onvif",
@@ -774,6 +1149,10 @@ class LanEngine:
             "speed": speed,
             "httpStatus": st
         }
+
+    def subscribe_events(self, cam: LanCamera, on_event: Callable[[dict[str, Any]], None]) -> "OnvifEventSubscriber":
+        """Starts an asynchronous ONVIF event subscription for the camera."""
+        return OnvifEventSubscriber(self, cam, on_event)
 
 
 class AnykaLanSpeaker:
@@ -893,6 +1272,144 @@ class AnykaLanSpeaker:
                 sock.close()
             except Exception:
                 pass
+
+
+class OnvifEventSubscriber:
+    """Subscribes to an ONVIF camera's Events service via WS-PullPoint and dispatches notifications."""
+
+    def __init__(self, engine: LanEngine, cam: LanCamera, on_event: Callable[[dict[str, Any]], None]):
+        self.engine = engine
+        self.cam = cam
+        self.on_event = on_event
+        self.running = True
+        self.subscription_url = ""
+        self.last_event_time = 0.0
+        self.thread = threading.Thread(target=self._worker, daemon=True, name=f"onvif-events-{cam.ip}")
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _create_subscription(self) -> bool:
+        event_service = self.cam.events_service_url or f"http://{self.cam.ip}:{self.cam.port}/onvif/event_service"
+        body = '''<tev:CreatePullPointSubscription xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+  <tev:InitialTerminationTime>PT300S</tev:InitialTerminationTime>
+</tev:CreatePullPointSubscription>'''
+        try:
+            st, resp = self.engine.onvif_soap(
+                event_service,
+                "http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest",
+                body,
+                self.cam.username,
+                self.cam.password,
+                timeout=6.0
+            )
+            if st < 300 and "<Fault>" not in resp:
+                root = ET.fromstring(resp)
+                for node in root.iter():
+                    if "Address" in node.tag and node.text and node.text.startswith("http"):
+                        self.subscription_url = node.text.strip()
+                        logger.info(f"[OnvifEvents] PullPoint subscription established for {self.cam.ip}: {self.subscription_url}")
+                        return True
+        except Exception as e:
+            logger.warning(f"[OnvifEvents] CreatePullPointSubscription error on {self.cam.ip}: {e}")
+        return False
+
+    def _worker(self):
+        pull_body = '''<tev:PullMessages xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+  <tev:Timeout>PT5S</tev:Timeout>
+  <tev:MessageLimit>10</tev:MessageLimit>
+</tev:PullMessages>'''
+        while self.running:
+            # Alerts must be completely disabled while camera is active and connection is idle.
+            # Alerts are only pulled and dispatched when explicitly enabled (in Standby mode).
+            if not self.engine.are_alerts_enabled():
+                time.sleep(0.5)
+                continue
+
+            if not self.subscription_url:
+                if not self._create_subscription():
+                    time.sleep(5.0)
+                    continue
+
+            try:
+                st, resp = self.engine.onvif_soap(
+                    self.subscription_url,
+                    "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest",
+                    pull_body,
+                    self.cam.username,
+                    self.cam.password,
+                    timeout=10.0
+                )
+                if not self.engine.are_alerts_enabled():
+                    continue
+
+                if st >= 300 or "<Fault>" in resp:
+                    logger.debug(f"[OnvifEvents] PullMessages fault/expired (HTTP {st}), renewing subscription...")
+                    self.subscription_url = ""
+                    time.sleep(1.0)
+                    continue
+
+                root = ET.fromstring(resp)
+                for notif in root.iter():
+                    if not self.engine.are_alerts_enabled():
+                        break
+                    if notif.tag.rsplit("}", 1)[-1] == "NotificationMessage":
+                        topic = ""
+                        utc_time = ""
+                        data_items = {}
+                        for child in notif.iter():
+                            tag = child.tag.rsplit("}", 1)[-1]
+                            if tag == "Topic":
+                                topic = (child.text or "").strip()
+                            elif tag == "Message":
+                                utc_time = child.attrib.get("UtcTime", "")
+                            elif tag == "SimpleItem":
+                                name = child.attrib.get("Name", "")
+                                val = child.attrib.get("Value", "")
+                                if name:
+                                    data_items[name] = val
+
+                        is_active = False
+                        for k, v in data_items.items():
+                            if str(v).lower() in ("true", "1", "motion", "detected"):
+                                is_active = True
+                                break
+
+                        # 1. Ignore inactive/cleared events (e.g. IsMotion: false)
+                        if not LanEngine.is_active_alarm(data_items):
+                            logger.debug(f"[OnvifEvents] Ignoring inactive/cleared event on {self.cam.ip}: {topic} {data_items}")
+                            continue
+
+                        # 2. Ignore motion alarms generated during camera movement or post-movement settling
+                        is_motion = LanEngine.is_motion_event(topic, data_items)
+                        if is_motion:
+                            moving, remaining = self.engine.is_camera_moving_or_cooling(self.cam.ip, self.cam, event_utc=utc_time)
+                            if moving:
+                                logger.info(f"[OnvifEvents] Completely dropping and forgetting motion alarm on {self.cam.ip} during/after movement ({remaining:.1f}s cooldown remaining): {topic}")
+                                continue
+
+                        if is_active or is_motion or "Alarm" in topic or "Analytics" in topic:
+                            now = time.monotonic()
+                            if (now - self.last_event_time) > 2.0:
+                                self.last_event_time = now
+                                event_dict = {
+                                    "camera_id": self.cam.id,
+                                    "camera_ip": self.cam.ip,
+                                    "topic": topic,
+                                    "utc_time": utc_time or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                    "data": data_items,
+                                    "is_active": is_active,
+                                }
+                                logger.info(f"[OnvifEvents] Event triggered on {self.cam.ip}: {topic} {data_items}")
+                                try:
+                                    self.on_event(event_dict)
+                                except Exception as e:
+                                    logger.warning(f"[OnvifEvents] on_event handler error: {e}")
+            except Exception as e:
+                logger.debug(f"[OnvifEvents] PullMessages exception: {e}")
+                self.subscription_url = ""
+                time.sleep(3.0)
 
 
 lan_engine = LanEngine()

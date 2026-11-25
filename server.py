@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import asyncio, base64, json, logging, os, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request, re, uuid, xml.etree.ElementTree as ET
+import asyncio, base64, collections, contextlib, datetime, json, logging, os, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request, re, uuid, xml.etree.ElementTree as ET
 import edge_tts
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 from lan_engine import lan_engine, LanCamera, AnykaLanSpeaker
+from subagent_engine import subagent_manager
+
+@contextlib.contextmanager
+def track_agent_tool(tool_name: str):
+    """Context manager to record that ChatGPT/agent is actively executing an MCP tool."""
+    lan_engine.record_agent_working(True, tool_name)
+    try:
+        yield
+    finally:
+        lan_engine.record_agent_working(False, tool_name)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,16 +24,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger("camxposed")
 
-from mcp.server.mcpserver import Context, Image, MCPServer
+class PermissiveVersions(list):
+    def __contains__(self, item):
+        return True
+
+import mcp.shared.version as mcp_version
+import mcp.server.session as mcp_session
+import mcp.server.streamable_http as mcp_shttp
+import mcp.server.transport_security as ts
+
+_permissive_versions = PermissiveVersions(mcp_version.SUPPORTED_PROTOCOL_VERSIONS)
+mcp_version.SUPPORTED_PROTOCOL_VERSIONS = _permissive_versions
+mcp_session.SUPPORTED_PROTOCOL_VERSIONS = _permissive_versions
+if hasattr(mcp_shttp, "SUPPORTED_PROTOCOL_VERSIONS"):
+    mcp_shttp.SUPPORTED_PROTOCOL_VERSIONS = _permissive_versions
+
+async def _permissive_validate_protocol_version(self, request, send):
+    return True
+mcp_shttp.StreamableHTTPServerTransport._validate_protocol_version = _permissive_validate_protocol_version
+
+_orig_check_accept_headers = mcp_shttp.StreamableHTTPServerTransport._check_accept_headers
+def _permissive_check_accept_headers(self, request):
+    accept_header = request.headers.get("accept", "")
+    if "*/*" in accept_header or not accept_header:
+        return True, True
+    accept_types = [media_type.strip() for media_type in accept_header.split(",")]
+    has_json = any(media_type.startswith(mcp_shttp.CONTENT_TYPE_JSON) or media_type == "*/*" for media_type in accept_types)
+    has_sse = any(media_type.startswith(mcp_shttp.CONTENT_TYPE_SSE) or media_type == "*/*" for media_type in accept_types)
+    return has_json, has_sse
+mcp_shttp.StreamableHTTPServerTransport._check_accept_headers = _permissive_check_accept_headers
+
+try:
+    from mcp.server.mcpserver import Context, Image, MCPServer
+except ImportError:
+    from mcp.server.fastmcp import Context, Image, FastMCP as MCPServer
 from mcp.types import AudioContent, TextContent
 
 # MCP tool registry
-mcp = MCPServer(
-    name="कैमXposed",
-    title="कैमXposed",
-    description="CamXposed MCP Bridge - Smart IP Camera Control, Vision & PTZ. CAMERA CONTRACT: Start with camera_list; it automatically performs a bounded LAN discovery when the inventory is empty or stale and selects the first usable camera if none is selected. Camera-targeted tools also self-resolve: explicit camera_id wins; otherwise use the selected usable camera, rediscovering if necessary. Never ask the user to run discovery or selection manually. Use camera_discover only for an explicit refresh or diagnostics, not as a prerequisite. Discovery filters NVR/DVR/recorder endpoints and requires a usable ONVIF media profile. Use camera_select only when the user explicitly chooses a camera.",
-    version="1.0.0",
+_desc = (
+    "CamXposed MCP Server for IP camera control, vision, and PTZ. "
+    "The primary active camera is the local LAN ONVIF camera. "
+    "Guidelines for voice sessions: During inspection, movement, and observation, remain quiet and execute tool actions silently without commenting on every frame. "
+    "Once your investigation is complete, ALWAYS verbally speak your final conclusion aloud to the user over the voice channel "
+    "(clearly announce both positive and negative results, e.g. whether the requested object was found or not found), "
+    "so the user clearly hears the final answer without needing to look at a screen."
 )
+try:
+    mcp = MCPServer(
+        name="कैमXposed",
+        title="कैमXposed",
+        description=_desc,
+        version="1.0.0",
+        stateless_http=True,
+        json_response=True,
+    )
+except TypeError:
+    mcp = MCPServer(
+        name="कैमXposed",
+        instructions=_desc,
+        stateless_http=True,
+        json_response=True,
+    )
+if hasattr(mcp, "settings"):
+    mcp.settings.transport_security = ts.TransportSecuritySettings(enable_dns_rebinding_protection=False)
 # Discovery uses native WS-Discovery over UDP 3702. No Avahi, zeroconf, or UPnP dependency.
 
 SERVICE_TYPE="_camxposed._tcp.local."
@@ -212,6 +275,11 @@ class Client:
         self.connected_cameras: set[str] = set()
         self.cached_cameras: list[Camera] = []
         self.cached_cameras_time: float = 0.0
+        self.recent_events: collections.deque[dict[str, Any]] = collections.deque(maxlen=100)
+        self.event_subscribers: dict[str, Any] = {}
+        env_cam_ip = (os.getenv("CAMXPOSED_CAMERA_IP") or "").strip()
+        if env_cam_ip:
+            self.camera = f"lan_{env_cam_ip.replace('.', '_')}"
         # Local speaker volume percentage (0-100), persisted to config file, defaults to 50%
         self.config_dir = Path(os.getenv("CAMXPOSED_CONFIG_DIR", Path.home() / ".config" / "camxposed"))
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -227,6 +295,62 @@ class Client:
                 lock = threading.RLock()
                 self.camera_operation_locks[key] = lock
             return lock
+
+    def purge_movement_events(self, cam_key: str) -> int:
+        """Completely purges/forgets any events that occurred on cam_key during or within 4s of movement."""
+        from lan_engine import _normalize_cam_keys
+        norm_keys = set(_normalize_cam_keys(cam_key))
+        purged = 0
+        now = time.time()
+        with self.lock:
+            retained = collections.deque(maxlen=100)
+            for ev in self.recent_events:
+                ev_cam = ev.get("camera_ip") or ev.get("camera_id") or ""
+                ev_time = ev.get("received_at", now)
+                is_cooling, _ = lan_engine.is_camera_moving_or_cooling(ev_cam, event_utc=ev.get("utc_time"))
+                if (ev_cam in norm_keys or not cam_key) and (is_cooling or (now - ev_time < 5.0)):
+                    purged += 1
+                    continue
+                retained.append(ev)
+            self.recent_events = retained
+        if purged > 0:
+            logger.info(f"[Server ONVIF Event] Purged {purged} movement-generated events for camera {cam_key}")
+        return purged
+
+    def on_lan_event(self, event_dict: dict[str, Any]) -> None:
+        # Alerts are completely disabled while camera is active and connection is idle.
+        # Only process alerts when explicitly enabled (Standby mode).
+        if not lan_engine.are_alerts_enabled():
+            return
+        topic = event_dict.get("topic", "")
+        data = event_dict.get("data", {})
+        camera_ip = event_dict.get("camera_ip", "")
+        event_dict["received_at"] = time.time()
+        # 1. Ignore inactive/cleared events
+        if not lan_engine.is_active_alarm(data):
+            logger.debug(f"[Server ONVIF Event] Ignoring inactive/cleared event on {camera_ip}: {topic} ({data})")
+            return
+        # 2. Suppress and completely delete motion alarms generated during or after camera movement
+        if lan_engine.is_motion_event(topic, data):
+            is_moving, remaining = lan_engine.is_camera_moving_or_cooling(camera_ip, event_utc=event_dict.get("utc_time"))
+            if is_moving:
+                logger.info(f"[Server ONVIF Event] Completely dropping and forgetting motion event on {camera_ip} during camera movement/settling ({remaining:.1f}s cooldown remaining): {topic}")
+                return
+        logger.info(f"[Server ONVIF Event] {topic} on {camera_ip}: {data}")
+        self.recent_events.append(event_dict)
+
+    def ensure_event_subscription(self, cam: LanCamera) -> None:
+        if cam.id in self.event_subscribers:
+            return
+        if not lan_engine.are_alerts_enabled():
+            return
+        if cam.events_service_url:
+            try:
+                sub = lan_engine.subscribe_events(cam, self.on_lan_event)
+                self.event_subscribers[cam.id] = sub
+                logger.info(f"Subscribed to ONVIF events for {cam.id} ({cam.ip})")
+            except Exception as e:
+                logger.warning(f"Could not subscribe to events for {cam.id}: {e}")
 
     def _load_speaker_volume(self) -> int:
         # Check environment variable first
@@ -427,47 +551,98 @@ class Client:
 
     def find_lan_camera(self, cid: str) -> Optional[LanCamera]:
         """Lookup a camera in the native LAN engine by ID or IP."""
+        cam = None
         with lan_engine.lock:
             if cid in lan_engine.discovered_cameras:
-                return lan_engine.discovered_cameras[cid]
-            if cid.startswith("lan_"):
+                cam = lan_engine.discovered_cameras[cid]
+            elif cid.startswith("lan_"):
                 ip = cid[4:].replace("_", ".")
-                for cam in lan_engine.discovered_cameras.values():
-                    if cam.ip == ip: return cam
-            if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", cid):
-                for cam in lan_engine.discovered_cameras.values():
-                    if cam.ip == cid: return cam
-                # Auto-register on the fly for raw IP
-                return lan_engine.interrogate_onvif(cid)
-        return None
+                for c in lan_engine.discovered_cameras.values():
+                    if c.ip == ip:
+                        cam = c
+                        break
+            elif re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", cid):
+                for c in lan_engine.discovered_cameras.values():
+                    if c.ip == cid:
+                        cam = c
+                        break
+                if not cam:
+                    # Auto-register on the fly for raw IP
+                    cam = lan_engine.interrogate_onvif(cid)
+        if cam:
+            self.ensure_event_subscription(cam)
+        return cam
 
     def resolve_camera(self, camera_id: Optional[str] = None):
         target = str(camera_id).strip() if camera_id and str(camera_id).strip() else None
         if target:
+            # 1. First priority: Check if target directly matches a known LAN camera ID or IP
             lan_cam = self.find_lan_camera(target)
             if lan_cam:
                 return None, lan_cam.id
-            # A remembered LAN ID/IP is only a hint; DHCP may have changed it.
+
+            # 2. If target looks like a LAN IP or lan_ prefix, refresh ONVIF discovery
             if target.startswith("lan_") or re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", target):
                 try:
                     lan_engine.discover_all(timeout=4.0)
                     with lan_engine.lock:
                         cameras = list(lan_engine.discovered_cameras.values())
-                    if not cameras:
-                        raise RuntimeError("Automatic ONVIF discovery returned zero cameras.")
-                    chosen = next((c for c in cameras if c.ip == target or c.id == target), cameras[0])
-                    with self.lock:
-                        self.camera = chosen.id
-                    logger.info("[resolve_camera] Refreshed stale LAN target %s -> %s", target, chosen.id)
-                    return None, chosen.id
+                    if cameras:
+                        chosen = next((c for c in cameras if c.ip == target or c.id == target), cameras[0])
+                        with self.lock:
+                            self.camera = chosen.id
+                        logger.info("[resolve_camera] Refreshed stale LAN target %s -> %s", target, chosen.id)
+                        return None, chosen.id
                 except Exception as e:
                     logger.warning(f"[resolve_camera] Native LAN refresh failed: {e}")
-                    raise RuntimeError(f"Could not resolve camera target {target}; automatic ONVIF discovery failed: {e}") from e
+
+            # 3. Optional gateway check: Only if a live CamXposed mobile gateway is already connected
+            try:
+                with self.lock:
+                    cand = self.gateways.get(self.selected)
+                if cand and self.live(cand):
+                    return cand, target
+            except Exception:
+                pass
+
+            # 4. LAN IS THE REAL DEAL & FIRST PRIORITY:
+            # If target is not on a live mobile gateway or mobile gateway is offline,
+            # map immediately to the primary active LAN camera!
+            with lan_engine.lock:
+                if lan_engine.discovered_cameras:
+                    first_lan = next(iter(lan_engine.discovered_cameras.values()))
+                    logger.info("[resolve_camera] Target '%s' is not on gateway / LAN is first priority -> using %s (%s)",
+                                target, first_lan.id, first_lan.ip)
+                    with self.lock:
+                        self.camera = first_lan.id
+                    return None, first_lan.id
+
+            # If no LAN cameras currently cached, run bounded ONVIF discovery
+            try:
+                lan_engine.discover_all(timeout=3.0)
+                with lan_engine.lock:
+                    if lan_engine.discovered_cameras:
+                        first_lan = next(iter(lan_engine.discovered_cameras.values()))
+                        logger.info("[resolve_camera] Discovered LAN camera %s (%s); mapping target '%s' to it",
+                                    first_lan.id, first_lan.ip, target)
+                        with self.lock:
+                            self.camera = first_lan.id
+                        return None, first_lan.id
+            except Exception as e:
+                logger.warning(f"[resolve_camera] Automatic ONVIF fallback discovery failed: {e}")
+
+            # 5. Optional last resort: try CamXposed gateway discovery
             try:
                 g = self.gateway()
                 return g, target
             except Exception:
-                return None, target
+                pass
+
+            fallback_cid = os.getenv("CAMXPOSED_DEFAULT_CAMERA_ID", "").strip()
+            if fallback_cid:
+                return None, fallback_cid
+            raise RuntimeError(f"Could not resolve camera target '{target}'. No LAN camera found and CamXposed gateway offline.")
+
         # Reuse a selected camera only while it is still present. If its DHCP
         # address changed, discard the stale ID and run a fresh LAN discovery.
         with self.lock:
@@ -482,12 +657,15 @@ class Client:
                         self.camera = None
             else:
                 try:
-                    return self.gateway(), selected
-                except Exception as e:
-                    logger.warning(f"[resolve_camera] Previously selected bridge camera unavailable: {e}")
                     with self.lock:
-                        if self.camera == selected:
-                            self.camera = None
+                        cand = self.gateways.get(self.selected)
+                    if cand and self.live(cand):
+                        return cand, selected
+                except Exception:
+                    pass
+                with self.lock:
+                    if self.camera == selected:
+                        self.camera = None
 
         # Auto-discover before failing. The scan populates this process's own
         # inventory, so callers never need to invoke discovery tools manually.
@@ -526,10 +704,17 @@ class Client:
     def connect(self,g,cid):
         cid_str = str(cid)
         lan_cam = self.find_lan_camera(cid_str)
+        if not lan_cam:
+            with lan_engine.lock:
+                if lan_engine.discovered_cameras:
+                    lan_cam = next(iter(lan_engine.discovered_cameras.values()))
         if lan_cam:
-            return {"ok": True, "cameraId": cid_str, "provider": "native_onvif", "ip": lan_cam.ip}
+            return {"ok": True, "cameraId": lan_cam.id, "provider": "native_onvif", "ip": lan_cam.ip}
         if not g:
-            g = self.gateway()
+            try:
+                g = self.gateway()
+            except Exception:
+                return {"ok": False, "error": f"Camera {cid_str} not found on LAN and CamXposed gateway offline"}
         with self.lock:
             if cid_str in self.connected_cameras:
                 return {"ok":True,"cameraId":cid_str,"alreadyConnected":True}
@@ -542,6 +727,14 @@ class Client:
 
     def move(self,g,cid,direction,speed=8,duration=500):
         lan_cam = self.find_lan_camera(cid)
+        if not lan_cam:
+            with lan_engine.lock:
+                if lan_engine.discovered_cameras:
+                    lan_cam = next(iter(lan_engine.discovered_cameras.values()))
+                    logger.info(f"[move] Camera '{cid}' not on LAN; falling back to primary LAN camera {lan_cam.id}")
+        cam_target = lan_cam.ip if lan_cam else cid
+        lan_engine.record_camera_movement(cam_target, duration_ms=(0 if direction == "stop" else duration))
+        self.purge_movement_events(cam_target)
         if lan_cam:
             return lan_engine.ptz_move(lan_cam, direction, speed, duration)
         if not g:
@@ -555,15 +748,20 @@ class Client:
     def observe(self, g, cid, width=800):
         t0 = time.time()
         lan_cam = self.find_lan_camera(cid)
+        if not lan_cam:
+            with lan_engine.lock:
+                if lan_engine.discovered_cameras:
+                    lan_cam = next(iter(lan_engine.discovered_cameras.values()))
+                    logger.info(f"[observe] Camera '{cid}' not on LAN; falling back to primary LAN camera {lan_cam.id}")
         if lan_cam:
             logger.info(f"[observe] Fetching pristine snapshot directly via native LAN ONVIF from {lan_cam.ip}...")
             raw = lan_engine.capture_snapshot(lan_cam)
             if raw:
-                logger.info(f"[observe] Native LAN snapshot captured for camera {cid}: {len(raw)} bytes in {time.time() - t0:.2f}s")
+                logger.info(f"[observe] Native LAN snapshot captured for camera {lan_cam.id}: {len(raw)} bytes in {time.time() - t0:.2f}s")
                 with self.lock:
                     self.last_snapshot_bytes = raw
                     self.last_snapshot_time = time.time()
-                    self.camera_snapshots[str(cid)] = raw
+                    self.camera_snapshots[str(lan_cam.id)] = raw
                 return raw
             logger.warning(f"[observe] Native LAN snapshot failed for {lan_cam.ip}, falling back...")
 
@@ -639,6 +837,11 @@ class Client:
 
     def listen(self,g,cid,seconds=2):
         lan_cam = self.find_lan_camera(cid)
+        if not lan_cam:
+            with lan_engine.lock:
+                if lan_engine.discovered_cameras:
+                    lan_cam = next(iter(lan_engine.discovered_cameras.values()))
+                    logger.info(f"[listen] Camera '{cid}' not on LAN; falling back to primary LAN camera {lan_cam.id}")
         if lan_cam:
             logger.info(f"[listen] Capturing audio directly from native LAN ONVIF/RTSP ({lan_cam.ip})...")
             wav_bytes = lan_engine.capture_audio(lan_cam, seconds)
@@ -822,15 +1025,30 @@ class Client:
         # 1. First priority: Check if target camera has an IP reachable on Anyka TCP port 28772
         target_ip = ""
         lan_cam = self.find_lan_camera(cid)
+        if not lan_cam:
+            with lan_engine.lock:
+                if lan_engine.discovered_cameras:
+                    lan_cam = next(iter(lan_engine.discovered_cameras.values()))
+                    logger.info(f"[speak] Camera '{cid}' not on LAN; falling back to primary LAN camera {lan_cam.id}")
         if lan_cam and lan_cam.ip:
             target_ip = lan_cam.ip
         elif g and isinstance(cid, str) and cid.startswith("lan_"):
             target_ip = cid.removeprefix("lan_").replace("_", ".")
 
         if target_ip:
-            try:
-                logger.info(f"[speak] Attempting native Anyka TCP port 28772 speaker stream to {target_ip}...")
-                lan_speaker = AnykaLanSpeaker(target_ip, connect_timeout=1.2)
+            lan_speaker = None
+            last_err = None
+            for attempt in range(3):
+                try:
+                    logger.info(f"[speak] Attempting native Anyka TCP port 28772 speaker stream to {target_ip} (attempt {attempt+1}/3)...")
+                    lan_speaker = AnykaLanSpeaker(target_ip, connect_timeout=3.0)
+                    break
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"[speak] Anyka speaker connection attempt {attempt+1} failed: {e}")
+                    time.sleep(0.3)
+
+            if lan_speaker:
                 with self.lock:
                     self.active_lan_speaker = lan_speaker
                     self.active_playback_id = playback_id
@@ -865,8 +1083,8 @@ class Client:
                     "durationMs": duration_ms,
                     "message": f"Camera speaker is broadcasting over LAN TCP 28772 ({duration_ms}ms estimated). Call camera_speak_stop to interrupt."
                 }
-            except Exception as e:
-                logger.warning(f"[speak] Native Anyka TCP speaker to {target_ip}:28772 failed ({e}). Checking gateway fallback...")
+            else:
+                logger.warning(f"[speak] Native Anyka TCP speaker to {target_ip}:28772 failed ({last_err}). Checking gateway fallback...")
 
         # 2. Second priority: Fall back to Android CamXposed/Vector HTTP bridge if available
         if not g:
@@ -940,11 +1158,7 @@ class Client:
         return json.loads(b.decode())
 
     def onvif_soap(self, endpoint, action, body_xml, username="admin", password=""):
-        """Direct lightweight ONVIF SOAP caller with WS-Security UsernameToken Digest/Text support.
-
-CAMERA RESOLUTION: Registers only usable cameras with media profiles; NVR/DVR/recorder endpoints are excluded.
-
-CAMERA RESOLUTION: Returns only validated native LAN cameras with usable media profiles."""
+        """Direct lightweight ONVIF SOAP caller with WS-Security UsernameToken Digest/Text support."""
         nonce = os.urandom(16)
         created = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         import hashlib
@@ -993,9 +1207,7 @@ async def snapshot_route(request):
 
 @mcp.tool()
 def camera_discover():
-    """Discover CamXposed gateways and ONVIF cameras on LAN using native multi-protocol discovery (WS-Discovery UDP 3702, UPnP SSDP UDP 1900, mDNS DNS-SD).
-
-CAMERA RESOLUTION: Discover camera devices only. NVR/DVR/recorder endpoints and ONVIF devices without usable media profiles are excluded."""
+    """Discover available IP cameras and gateways on the local network."""
     lan_res = lan_engine.discover_all(timeout=2.0)
     # Refresh the combined camera list immediately after the live LAN scan.
     with client.lock:
@@ -1045,16 +1257,7 @@ CAMERA RESOLUTION: Discover camera devices only. NVR/DVR/recorder endpoints and 
 
 @mcp.tool()
 def camera_list():
-    """List available cameras (native LAN ONVIF and bridge-managed).
-
-    If the native inventory is empty or older than 30 seconds, this tool runs
-    one bounded LAN discovery automatically. It refreshes the combined list
-    and selects the first usable camera only when no valid selection exists.
-    Use camera_discover separately only for an explicit full refresh or
-    diagnostics; callers must not need to invoke it before listing cameras.
-    NVR/DVR/recorder endpoints and devices without usable media profiles are
-    excluded during discovery.
-    """
+    """List available cameras."""
     discovery = None
     discovery_error = None
     with lan_engine.lock:
@@ -1164,9 +1367,7 @@ def onvif_cameras():
     return {"ok": True, "provider": "native_lan", "count": len(cams), "cameras": cams}
 
 def camera_ptz_capabilities(camera_id: Optional[str] = None):
-    """Read the selected ONVIF camera's advertised PTZ capabilities, including velocity ranges, speed spaces, translation spaces, position spaces, and timeout range.
-
-CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
+    """Read the selected ONVIF camera's advertised PTZ capabilities."""
     g, cid = client.resolve_camera(camera_id)
     lan_cam = client.find_lan_camera(cid)
     if lan_cam:
@@ -1179,9 +1380,7 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
     return {"ok": False, "error": f"Camera {cid} does not expose ONVIF PTZ capabilities"}
 
 def camera_ptz_status(camera_id: Optional[str] = None):
-    """Read current ONVIF pan, tilt, zoom position coordinates and move status (IDLE/MOVING).
-
-CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
+    """Read current ONVIF pan, tilt, zoom position coordinates and move status (IDLE/MOVING)."""
     g, cid = client.resolve_camera(camera_id)
     lan_cam = client.find_lan_camera(cid)
     if lan_cam:
@@ -1202,9 +1401,7 @@ def camera_ptz_relative_move(camera_id: Optional[str] = None, x: float = 0.0, y:
     - zoom: Normalized relative zoom offset (-1.0 to 1.0).
     - speed: Integer 1-8 controlling the movement speed. Default is 4.
     - wait: Boolean. Default is True. Waits for mechanical settling before returning.
-    
-
-CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Do not require a separate discovery/select call."""
+    """
     g, cid = client.resolve_camera(camera_id)
     lan_cam = client.find_lan_camera(cid)
     if not lan_cam:
@@ -1223,6 +1420,9 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
     with client.ptz_state_lock:
         client.ptz_move_until[cid] = time.monotonic() + 0.8
 
+    cam_target = lan_cam.ip if lan_cam else cid
+    lan_engine.record_camera_movement(cam_target, duration_ms=800)
+
     if wait and (x != 0 or y != 0 or zoom != 0):
         time.sleep(0.8)
         res["settled"] = True
@@ -1230,9 +1430,7 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
 
 @mcp.tool()
 def camera_select(camera_id:str):
-    """Select/connect one camera for default operations. Input is an ID from camera_list(). Returns the selected camera.
-
-CAMERA RESOLUTION: Use only when the user explicitly chooses a camera. Other camera tools resolve selection automatically."""
+    """Select/connect one camera for operations. Input is an ID or IP from camera_list()."""
     cs=client.cameras()
     c=next((x for x in cs if x.id==camera_id),None)
     if not c:
@@ -1240,6 +1438,11 @@ CAMERA RESOLUTION: Use only when the user explicitly chooses a camera. Other cam
         if lan_cam:
             client.camera = lan_cam.id
             return {"ok": True, "camera": {"id": lan_cam.id, "name": lan_cam.name, "provider": "native_onvif"}}
+        with lan_engine.lock:
+            if lan_engine.discovered_cameras:
+                first_lan = next(iter(lan_engine.discovered_cameras.values()))
+                client.camera = first_lan.id
+                return {"ok": True, "camera": {"id": first_lan.id, "name": first_lan.name, "provider": "native_onvif"}, "note": f"Fallback to primary LAN camera for '{camera_id}'"}
         raise ValueError("Unknown camera: "+camera_id)
     client.camera=camera_id
     g = None
@@ -1252,9 +1455,7 @@ CAMERA RESOLUTION: Use only when the user explicitly chooses a camera. Other cam
 
 @mcp.tool()
 def camera_status(camera_id:Optional[str]=None):
-    """Return camera liveness and capabilities. Uses the explicitly supplied camera_id; otherwise the selected camera, or automatically discovers and selects the first available camera.
-
-CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is selected, automatically discover and select the first usable camera. Refresh stale camera state automatically."""
+    """Return camera liveness and capabilities."""
     g, cid = client.resolve_camera(camera_id)
     cs = client.cameras(g, force_refresh=True)
     lan_cam = client.find_lan_camera(cid)
@@ -1277,70 +1478,122 @@ CAMERA RESOLUTION: If camera_id is omitted, use the selected camera; if none is 
     except Exception: pass
     c=next((c for c in cs if c.id==cid), None)
     return {"ok":True,"gateway":gj(g) if g else None,"camera":cj(c) if c else {"id": cid}}
+
+@mcp.tool()
+def camera_get_events(camera_id: Optional[str] = None, limit: int = 10):
+    """Retrieve recent ONVIF camera events (e.g. motion detection, line crossing, tamper, analytics alerts)."""
+    with track_agent_tool("camera_get_events"):
+        g, cid = client.resolve_camera(camera_id)
+        lan_cam = client.find_lan_camera(cid)
+        cam_ip = lan_cam.ip if lan_cam else None
+        
+        raw_events = list(client.recent_events)
+        events = []
+        for e in raw_events:
+            e_cam = e.get("camera_ip") or e.get("camera_id") or ""
+            if cam_ip and e_cam not in (cam_ip, cid):
+                continue
+            if lan_engine.is_motion_event(e.get("topic", ""), e.get("data", {})):
+                is_moving, _ = lan_engine.is_camera_moving_or_cooling(e_cam, event_utc=e.get("utc_time"))
+                if is_moving:
+                    continue
+            events.append(e)
+        
+        clamped_limit = max(1, min(limit, 50))
+        selected_events = events[-clamped_limit:]
+        return {
+            "ok": True,
+            "camera_id": cid,
+            "count": len(selected_events),
+            "events": selected_events
+        }
+
 @mcp.tool()
 def camera_observe(camera_id:Optional[str]=None,width:int=800,latest_frame:bool=False):
-    """Capture a frame from one camera and return a native MCP JPEG image.
+    """Capture a snapshot frame from the camera and return a JPEG image.
 
-    By default, waits until the most recent timed PTZ move for this camera has
-    finished, then waits an additional 400 ms for the view to settle before
-    capturing. This avoids immediately returning a frame from before/during a
-    just-requested movement.
+    Use this tool to visually inspect what the camera is seeing right now.
+    For text chat assistants searching for objects in the room: call camera_observe() directly to inspect the current view, and combine with camera_move() to scan all room sectors.
+    """
+    with track_agent_tool("camera_observe"):
+        g, cid = client.resolve_camera(camera_id)
+        with client.camera_operation_lock(cid):
+            try: client.connect(g, cid)
+            except Exception: pass
+            waited_ms = 0
+            if not latest_frame:
+                with client.ptz_state_lock:
+                    move_until = client.ptz_move_until.get(cid, 0.0)
+                delay = max(0.0, move_until - time.monotonic()) + 0.4
+                lan_cam = client.find_lan_camera(cid)
+                cam_target = lan_cam.ip if lan_cam else cid
+                is_moving, remaining = lan_engine.is_camera_moving_or_cooling(cam_target)
+                if is_moving and remaining > delay:
+                    delay = remaining
+                if delay > 0:
+                    logger.info(f"[camera_observe] Camera {cid} is in motion/settling; waiting {delay:.2f}s before capture...")
+                    time.sleep(delay)
+                    waited_ms = int(delay * 1000)
+            # Allow lightweight downscaling (down to 120px) to conserve LLM context tokens and bandwidth
+            target_width = max(120, min(int(width), 1280)) if width else 640
+            logger.info(f"[camera_observe] Capturing frame for camera {cid} (waited_ms={waited_ms}, width={target_width})...")
+            frame_bytes = client.observe(g, cid, target_width)
+            logger.info(f"[camera_observe] Returning native JPEG image ({len(frame_bytes)} bytes)")
+            return Image(data=frame_bytes, format="jpeg")
 
-    WARNING: latest_frame=True bypasses this wait and may return a stale or
-    mid-movement frame. Use only when you intentionally want an immediate grab.
-    
-
-CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
-    g, cid = client.resolve_camera(camera_id)
-    with client.camera_operation_lock(cid):
+def camera_listen(camera_id:Optional[str]=None,seconds:float=2):
+    """Capture a short audio sample for inspection. seconds is 0.25-5."""
+    with track_agent_tool("camera_listen"):
+        g, cid = client.resolve_camera(camera_id)
         try: client.connect(g, cid)
         except Exception: pass
-        waited_ms = 0
-        if not latest_frame:
-            with client.ptz_state_lock:
-                move_until = client.ptz_move_until.get(cid, 0.0)
-            delay = max(0.0, move_until - time.monotonic()) + 0.4
-            if delay > 0:
-                logger.info(f"[camera_observe] Camera {cid} is in motion/settling; waiting {delay:.2f}s before capture...")
-                time.sleep(delay)
-                waited_ms = int(delay * 1000)
-        # Allow lightweight downscaling (down to 120px) to conserve LLM context tokens and bandwidth
-        target_width = max(120, min(int(width), 1280)) if width else 640
-        logger.info(f"[camera_observe] Capturing frame for camera {cid} (waited_ms={waited_ms}, width={target_width})...")
-        frame_bytes = client.observe(g, cid, target_width)
-        logger.info(f"[camera_observe] Returning native JPEG image ({len(frame_bytes)} bytes)")
-        return Image(data=frame_bytes, format="jpeg")
+        logger.info(f"[camera_listen] Listening to camera {cid} for {seconds}s...")
+        res = client.listen(g,cid,max(.25,min(seconds,5)))
+        logger.info(f"[camera_listen] Done listening to camera {cid}")
+        return res
+
+if not os.getenv("CAMXPOSED_HIDE_VOICE_TOOLS"):
+    camera_listen = mcp.tool()(camera_listen)
 
 @mcp.tool()
-def camera_listen(camera_id:Optional[str]=None,seconds:float=2):
-    """Capture a short audio sample for inspection. seconds is 0.25-5.
+def camera_move(
+    camera_id: Optional[str] = None,
+    direction: str = "right",
+    speed: int = 8,
+    duration_ms: int = 700,
+    wait: bool = True,
+    return_image: bool = True,
+    width: int = 800,
+):
+    """Perform one PTZ move on the camera.
 
-CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
-    g, cid = client.resolve_camera(camera_id)
-    try: client.connect(g, cid)
-    except Exception: pass
-    logger.info(f"[camera_listen] Listening to camera {cid} for {seconds}s...")
-    res = client.listen(g,cid,max(.25,min(seconds,5)))
-    logger.info(f"[camera_listen] Done listening to camera {cid}")
-    return res
+    Use this tool to turn the camera and explore different sectors of the room.
+    For text chat assistants searching for objects in the room: call camera_move() systematically (e.g. speed=8, duration_ms=1000)
+    to sweep across the room and inspect each view directly.
 
-def camera_move(camera_id:Optional[str]=None,direction:str="right",speed:int=8,duration_ms:int=700,wait:bool=True,return_image:bool=True,width:int=800):
-    """Perform one manual PTZ move on the camera.
-
-    SPEED & DURATION WARNING:
-    - Default speed is 8 (maximum) and duration_ms is 700 ms.
-    - CRITICAL: A low speed like 3 for half a second (500-600ms) is WAY too low! The camera stepper motors have mechanical gear deadband/slack, so speed 3 for half a second barely nudges 1-2 degrees and appears completely frozen to the user.
-    - ALWAYS use speed 7 or 8 with duration 600-1200ms for standard visible framing adjustments. Do NOT choose low speeds like 1-4 unless the user explicitly asks for ultra-fine millimeter micro-adjustments. Run carefully and avoid weak half-second moves at low speeds!
+    CRITICAL DIRECTION SPECIFICATION:
+    - 'left': Pan camera counter-clockwise towards the left.
+    - 'right': Pan camera clockwise towards the right.
+    - 'up': Tilt camera upwards towards the ceiling.
+    - 'down': Tilt camera downwards towards the floor.
+    - 'stop': Halt all camera movement immediately.
 
     Parameters:
-    - direction: 'left', 'right', 'up', 'down', or 'stop'.
-    - speed: Integer 1-8. Default is 8. (Always prefer 7 or 8 for real, visible motion).
-    - duration_ms: Movement duration in milliseconds (100-2000). Default is 700 ms. (600-1200 ms recommended).
-    - wait: Boolean. Default is True. Waits for the physical movement to complete and settle before returning, ensuring the camera is completely still before any subsequent camera_observe frame capture.
-    
+    - camera_id: Target camera ID or IP (optional, uses active camera if omitted).
+    - direction: 'left', 'right', 'up', 'down', or 'stop'. Default is 'right'.
+    - speed: Integer 1-8. Default is 8.
+    - duration_ms: Movement duration in milliseconds (100-2000). Default is 700 ms.
+    - wait: Boolean. Default is True. Waits for physical movement to complete before returning.
+    - return_image: If True (default), returns a fresh post-movement JPEG image once settled.
+    - width: Returned image width in pixels (120-1280, default: 800).
+    """
 
-CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
-    dir_clean = str(direction).strip().lower()
+    # Allow camera_id to be omitted or passed positionally as direction
+    if camera_id in {"left", "right", "up", "down", "stop"} and (direction == "right" or not direction):
+        direction = camera_id
+        camera_id = None
+
+    dir_clean = str(direction or "").strip().lower()
     if dir_clean not in {"left", "right", "up", "down", "stop"}:
         logger.warning(f"[camera_move] Unknown direction '{direction}', defaulting to 'stop'")
         dir_clean = "stop"
@@ -1358,61 +1611,67 @@ CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; other
         duration_int = 700
     duration_ms = max(100, min(duration_int, 4000))
 
-    g, cid = client.resolve_camera(camera_id)
-    try: client.connect(g, cid)
-    except Exception: pass
+    with track_agent_tool(f"camera_move:{direction}"):
+        g, cid = client.resolve_camera(camera_id)
+        try: client.connect(g, cid)
+        except Exception: pass
 
-    logger.info(f"[camera_move] Moving camera {cid}: direction={direction}, speed={speed}, duration_ms={duration_ms}, return_image={return_image}")
-    with client.camera_operation_lock(cid):
-        move_started = time.monotonic()
-        result = client.move(g, cid, direction, speed, duration_ms)
-        # Record deadline from request start so a bridge that already waits for the
-        # movement duration does not cause a second full-duration wait.
-        with client.ptz_state_lock:
-            if direction == "stop":
-                client.ptz_move_until[cid] = time.monotonic()
-            else:
-                client.ptz_move_until[cid] = move_started + duration_ms / 1000.0
-
-        if (wait or return_image) and direction != "stop":
-            # An image-bearing PTZ call must always wait for movement completion,
-            # even when the caller disables the normal wait behavior.
-            settle_time = max(0.0, move_started + duration_ms / 1000.0 - time.monotonic()) + 0.4
-            time.sleep(settle_time)
-            result["settled"] = True
-
-        if return_image:
-            try:
-                # Capture directly while holding the per-camera lock. This guarantees
-                # the image belongs to the completed move and cannot race another PTZ.
+        logger.info(f"[camera_move] Moving camera {cid}: direction={direction}, speed={speed}, duration_ms={duration_ms}, return_image={return_image}")
+        with client.camera_operation_lock(cid):
+            move_started = time.monotonic()
+            result = client.move(g, cid, direction, speed, duration_ms)
+            # Record deadline from request start so a bridge that already waits for the
+            # movement duration does not cause a second full-duration wait.
+            with client.ptz_state_lock:
                 if direction == "stop":
-                    time.sleep(0.4)
-                frame_width = max(120, min(int(width), 1280)) if width else 800
-                frame_bytes = client.observe(g, cid, frame_width)
-                captured_at = time.time()
-                logger.info(f"[camera_move] Returning post-move image ({len(frame_bytes)} bytes)")
-                return [
-                    TextContent(type="text", text=json.dumps({
-                        **result,
-                        "imageCaptured": True,
-                        "imageCapturedAt": captured_at,
-                        "imageWidth": frame_width,
-                        "imageFreshness": "captured_after_movement_and_settling"
-                    }, ensure_ascii=False)),
-                    Image(data=frame_bytes, format="jpeg")
-                ]
-            except Exception as exc:
-                logger.warning(f"[camera_move] Movement succeeded but post-move snapshot failed: {exc}")
-                return [
-                    TextContent(type="text", text=json.dumps({
-                        **result,
-                        "imageCaptured": False,
-                        "imageError": str(exc)
-                    }, ensure_ascii=False))
-                ]
+                    client.ptz_move_until[cid] = time.monotonic()
+                else:
+                    client.ptz_move_until[cid] = move_started + duration_ms / 1000.0
 
-        logger.info(f"[camera_move] PTZ completed: {result}.")
-        return result
+            lan_cam = client.find_lan_camera(cid)
+            cam_target = lan_cam.ip if lan_cam else cid
+            lan_engine.record_camera_movement(cam_target, duration_ms=(0 if direction == "stop" else duration_ms))
+            client.purge_movement_events(cam_target)
+
+            if (wait or return_image) and direction != "stop":
+                # An image-bearing PTZ call must always wait for movement completion,
+                # even when the caller disables the normal wait behavior.
+                settle_time = max(0.0, move_started + duration_ms / 1000.0 - time.monotonic()) + 0.4
+                time.sleep(settle_time)
+                result["settled"] = True
+
+            if return_image:
+                try:
+                    # Capture directly while holding the per-camera lock. This guarantees
+                    # the image belongs to the completed move and cannot race another PTZ.
+                    if direction == "stop":
+                        time.sleep(0.4)
+                    frame_width = max(120, min(int(width), 1280)) if width else 800
+                    frame_bytes = client.observe(g, cid, frame_width)
+                    captured_at = time.time()
+                    logger.info(f"[camera_move] Returning post-move image ({len(frame_bytes)} bytes)")
+                    return [
+                        TextContent(type="text", text=json.dumps({
+                            **result,
+                            "imageCaptured": True,
+                            "imageCapturedAt": captured_at,
+                            "imageWidth": frame_width,
+                            "imageFreshness": "captured_after_movement_and_settling"
+                        }, ensure_ascii=False)),
+                        Image(data=frame_bytes, format="jpeg")
+                    ]
+                except Exception as exc:
+                    logger.warning(f"[camera_move] Movement succeeded but post-move snapshot failed: {exc}")
+                    return [
+                        TextContent(type="text", text=json.dumps({
+                            **result,
+                            "imageCaptured": False,
+                            "imageError": str(exc)
+                        }, ensure_ascii=False))
+                    ]
+
+            logger.info(f"[camera_move] PTZ completed: {result}.")
+            return result
 
 @mcp.tool()
 def camera_ptz(
@@ -1430,6 +1689,14 @@ def camera_ptz(
 ):
     """Unified local-first PTZ control.
 
+    CRITICAL DIRECTION SPECIFICATION:
+    - When action='move', direction specifies the movement:
+      - 'left': Turn camera towards the left.
+      - 'right': Turn camera towards the right.
+      - 'up': Tilt camera UP.
+      - 'down': Tilt camera DOWN.
+      - 'stop': Stops movement.
+
     Actions:
     - move: directional pan/tilt movement; direction left/right/up/down/stop.
     - relative_move: finite normalized movement; x/y/zoom range -1.0..1.0.
@@ -1439,51 +1706,39 @@ def camera_ptz(
     POST-MOVEMENT IMAGE CONTRACT:
     - For move and relative_move actions, return_image defaults to True and
       the tool returns a fresh JPEG image only after movement has ended and
-      the view has settled. Inspect this image before issuing another move.
-    - Set return_image=False when speed matters more than visual feedback or
-      when chaining deliberate movements without intermediate images.
+      the view has settled.
     - image_width controls the returned image width (120-1280; default 800).
-    - The image is included in this tool result; do not call camera_observe
-      just to obtain the frame from this movement.
-    - For visual search/framing, keep correcting while the target is near an
-      edge or partly out of frame. Use smaller corrections as it approaches
-      the middle; stop when the target is fully visible and comfortably
-      centred. Do not continue moving after that.
-    - If image capture fails, the movement result is still returned with
-      imageCaptured=false and imageError.
-
-    Uses the native LAN ONVIF camera directly whenever available. The Android
-    bridge is only a fallback for bridge-managed cameras. Camera selection and
-    discovery are automatic; do not call discovery or selection first.
     """
     op = str(action or "move").strip().lower()
+
     if op == "move":
         return camera_move(camera_id, direction, speed, duration_ms, wait, return_image, image_width)
     if op == "relative_move":
-        g, cid = client.resolve_camera(camera_id)
-        # Serialize the relative move and its follow-up frame as one operation.
-        with client.camera_operation_lock(cid):
-            result = camera_ptz_relative_move(camera_id, x, y, zoom, speed, wait or return_image)
-            if not return_image:
-                return result
-            try:
-                time.sleep(0.4)
-                frame_width = max(120, min(int(image_width), 1280)) if image_width else 800
-                frame_bytes = client.observe(g, cid, frame_width)
-                return [
-                    TextContent(type="text", text=json.dumps({
-                        **result,
-                        "imageCaptured": True,
-                        "imageCapturedAt": time.time(),
-                        "imageWidth": frame_width,
-                        "imageFreshness": "captured_after_movement_and_settling"
-                    }, ensure_ascii=False)),
-                    Image(data=frame_bytes, format="jpeg")
-                ]
-            except Exception as exc:
-                return [TextContent(type="text", text=json.dumps({
-                    **result, "imageCaptured": False, "imageError": str(exc)
-                }, ensure_ascii=False))]
+        with track_agent_tool("camera_ptz:relative_move"):
+            g, cid = client.resolve_camera(camera_id)
+            # Serialize the relative move and its follow-up frame as one operation.
+            with client.camera_operation_lock(cid):
+                result = camera_ptz_relative_move(camera_id, x, y, zoom, speed, wait or return_image)
+                if not return_image:
+                    return result
+                try:
+                    time.sleep(0.4)
+                    frame_width = max(120, min(int(image_width), 1280)) if image_width else 800
+                    frame_bytes = client.observe(g, cid, frame_width)
+                    return [
+                        TextContent(type="text", text=json.dumps({
+                            **result,
+                            "imageCaptured": True,
+                            "imageCapturedAt": time.time(),
+                            "imageWidth": frame_width,
+                            "imageFreshness": "captured_after_movement_and_settling"
+                        }, ensure_ascii=False)),
+                        Image(data=frame_bytes, format="jpeg")
+                    ]
+                except Exception as exc:
+                    return [TextContent(type="text", text=json.dumps({
+                        **result, "imageCaptured": False, "imageError": str(exc)
+                    }, ensure_ascii=False))]
     if op == "status":
         return camera_ptz_status(camera_id)
     if op == "capabilities":
@@ -1491,6 +1746,95 @@ def camera_ptz(
     raise ValueError(
         "action must be move, relative_move, status, or capabilities"
     )
+
+
+@mcp.tool()
+def spawn_subagent(
+    search_entity_description: str,
+    previous_instructions: str,
+    caller_identity: str = "live",
+    camera_id: Optional[str] = None,
+):
+    """Search the room for an object, person, or target using an autonomous camera subagent.
+
+    Call this tool whenever the user asks to find, locate, search for, or spot anything in the room (e.g. 'अलमारी ढूंढो', 'इंसान ढूंढो', 'find my keys').
+    The subagent sweeps the room in the background and reports back automatically once finished.
+
+    Parameters:
+    - search_entity_description: The name or description of the target to find (e.g. 'white colored Ganesh idol', 'person / human', 'cupboard').
+    - previous_instructions: Quoted system instructions or conversation context.
+    - caller_identity: Operating mode ('live' for voice, 'chat' for text).
+    - camera_id: Target camera ID or IP (optional).
+
+    Returns:
+    - Confirms background visual search has started.
+    """
+    entity = search_entity_description.strip()
+    g, cid = client.resolve_camera(camera_id)
+    try: client.connect(g, cid)
+    except Exception: pass
+
+    with track_agent_tool("spawn_subagent"):
+        # Log to server logger and dedicated persistent audit log file
+        log_entry = {
+            "timestamp": time.time(),
+            "time_iso": datetime.datetime.now().isoformat(),
+            "search_entity_description": entity,
+            "caller_identity": caller_identity,
+            "previous_instructions": previous_instructions,
+            "camera_id": cid,
+        }
+        logger.info(f"[spawn_subagent] AUDIT: entity='{entity}', caller_identity='{caller_identity}', previous_instructions={previous_instructions[:200]!r}")
+        try:
+            audit_file = Path("/tmp/camxposed-mcp/caller_identity_audit.log")
+            audit_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(audit_file, "a", encoding="utf-8") as af:
+                af.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"[spawn_subagent] Failed to write audit log: {e}")
+
+        res = subagent_manager.start_subagent_task(
+            search_entity_description=entity,
+            caller_identity=caller_identity,
+            previous_instructions=previous_instructions,
+            camera_id=cid,
+        )
+        # If direct camera mode was triggered for chat/subagent, provide initial frame
+        if res.get("status") == "direct_camera_mode" or (not res.get("ok") and res.get("error_code") == "IS_SUBAGENT"):
+            try:
+                frame_bytes = client.observe(g, cid, 800)
+                if frame_bytes:
+                    return [
+                        TextContent(type="text", text=json.dumps(res, ensure_ascii=False)),
+                        Image(data=frame_bytes, format="jpeg")
+                    ]
+            except Exception:
+                pass
+        return res
+
+
+@mcp.tool()
+def subagent_status(camera_id: Optional[str] = None):
+    """Check the status, progress, and visual findings of the background camera-search subagent.
+
+    NOTE: This is ONLY used by real-time voice assistants ('live') to track background search progress.
+    Pure-text chat assistants ('chat') inspect and move the camera directly, and do NOT use subagent_status.
+    """
+    with track_agent_tool("subagent_status"):
+        status_info, frame_bytes = subagent_manager.get_status()
+        if frame_bytes:
+            return [
+                TextContent(type="text", text=json.dumps(status_info, ensure_ascii=False)),
+                Image(data=frame_bytes, format="jpeg")
+            ]
+        return status_info
+
+
+@mcp.tool()
+def stop_subagent():
+    """Cancel and stop an actively running background camera search subagent."""
+    with track_agent_tool("stop_subagent"):
+        return subagent_manager.cancel_task()
 
 
 def tts(text: str, voice: Optional[str] = None, volume_percent: Optional[int] = None):
@@ -1529,7 +1873,9 @@ def tts(text: str, voice: Optional[str] = None, volume_percent: Optional[int] = 
                 communicate = edge_tts.Communicate(text=clean_text, voice=voice)
             await communicate.save(mp3)
         try:
-            asyncio.run(generate())
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(lambda: asyncio.run(generate())).result()
         except Exception as exc:
             raise RuntimeError(f"Edge TTS failed for voice {voice}: {exc}") from exc
         try:
@@ -1573,42 +1919,19 @@ def camera_speaker_volume(volume_percent: Optional[int] = None) -> dict[str, Any
         "message": f"Current camera speaker volume is {client.local_speaker_volume_percent}%"
     }
 
-@mcp.tool()
 def camera_speak(text: Optional[str] = None, camera_id: Optional[str] = None, wait: bool = False,
                  voice: Optional[str] = None, volume_percent: Optional[int] = None,
                  action: str = "speak"):
-    """Broadcast spoken announcements, singing, or melodies out loud into the physical room through the camera speaker.
+    """Speak text through the camera speaker using text-to-speech.
 
-    CRITICAL USAGE INSTRUCTIONS:
-    - Camera selection and LAN/ONVIF discovery are automatic inside this tool. Never ask the user to run discovery tools or require a separate discovery call first.
-    - Omit camera_id unless the user explicitly identifies a particular camera; remembered camera IDs may be stale after DHCP changes.
-    - ONLY call this tool when the user EXPLICITLY asks to broadcast, announce, speak, or sing THROUGH THE CAMERA (e.g. "tell whoever is in the room that dinner is ready", "announce via the camera", "sing a song through the camera speaker").
-    - NEVER call this tool to respond to normal conversational queries, status updates, or to acknowledge commands. Your normal voice chat responses are already delivered directly to the user through your own conversation channel!
-    - Do NOT narrate your actions through the camera (e.g., do NOT call camera_speak to say "I am checking the camera" or "Camera moved").
-
-    VOLUME:
-    - volume_percent: Integer 0-100 (defaults to 50% half volume). Can be adjusted per-utterance or persistently via camera_speaker_volume.
-
-    VOICE & LANGUAGE:
-    - Hindi text automatically uses hi-IN-MadhurNeural.
-    - English text automatically uses en-IN-PrabhatNeural (crystal clear English without accent distortion).
-    - Custom voice can be provided in the voice parameter.
-
-    SINGING / MELODY / CHANTING (SSML):
-    - When asked to sing, chant, or hum a tune, provide SSML with <prosody pitch="+XHz" rate="Y%"> or semitones (pitch="+5st").
-      Example:
-        <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="hi-IN">
-          <voice name="hi-IN-MadhurNeural">
-            <prosody pitch="+40Hz" rate="-10%">हैप्पी </prosody>
-            <prosody pitch="+70Hz" rate="-10%">बर्थडे </prosody>
-            <prosody pitch="+100Hz" rate="-20%">टू यू! </prosody>
-          </voice>
-        </speak>
-
-    Playback streams in real-time. Can be interrupted at any moment using camera_speak_stop.
-    
-
-CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
+    Parameters:
+    - text: Text or SSML to speak.
+    - camera_id: Target camera ID or IP (optional).
+    - wait: Whether to wait for playback to finish before returning (default: False).
+    - voice: Edge TTS voice name (optional).
+    - volume_percent: Speaker volume percentage 0-100 (optional).
+    - action: 'speak', 'get_volume', or 'set_volume'.
+    """
     op = str(action or "speak").strip().lower()
     if op == "get_volume":
         return camera_speaker_volume()
@@ -1621,28 +1944,30 @@ CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; other
     if not text or not str(text).strip():
         raise ValueError("text is required for action='speak'")
 
-    g, cid = client.resolve_camera(camera_id)
-    try: client.connect(g, cid)
-    except Exception: pass
-    vol = client.local_speaker_volume_percent if volume_percent is None else max(0, min(100, int(volume_percent)))
-    logger.info(f"[camera_speak] Speaking through camera {cid} (wait={wait}, voice={voice}, volume={vol}%): '{text[:80]}...'")
-    audio = tts(text, voice=voice, volume_percent=vol)
-    logger.info(f"[camera_speak] Generated {len(audio)} bytes G.711 A-law audio from Edge TTS. Launching stream...")
-    res = client.speak(g, cid, audio, wait=wait)
-    res["speakerVolumePercent"] = vol
-    logger.info(f"[camera_speak] Result: {res}")
-    return res
+    with track_agent_tool("camera_speak"):
+        g, cid = client.resolve_camera(camera_id)
+        try: client.connect(g, cid)
+        except Exception: pass
+        vol = client.local_speaker_volume_percent if volume_percent is None else max(0, min(100, int(volume_percent)))
+        logger.info(f"[camera_speak] Speaking through camera {cid} (wait={wait}, voice={voice}, volume={vol}%): '{text[:80]}...'")
+        audio = tts(text, voice=voice, volume_percent=vol)
+        logger.info(f"[camera_speak] Generated {len(audio)} bytes G.711 A-law audio from Edge TTS. Launching stream...")
+        res = client.speak(g, cid, audio, wait=wait)
+        res["speakerVolumePercent"] = vol
+        logger.info(f"[camera_speak] Result: {res}")
+        return res
 
-@mcp.tool()
 def camera_speak_stop(camera_id:Optional[str]=None, reason:str="user_barge_in"):
-    """Immediately stop and cut off any active camera speech/talkback playback. Use for instant barge-in response when user speaks or interrupts.
-
-CAMERA RESOLUTION: Camera selection is automatic: explicit camera_id wins; otherwise use the selected camera, or discover and select the first usable camera. Do not call camera_select/onvif_discover first."""
+    """Stop active speech playback on the camera speaker."""
     g, cid = client.resolve_camera(camera_id)
     logger.info(f"[camera_speak_stop] Stopping speech on camera {cid} (reason: {reason})")
     res = client.speak_stop(g, cid, reason)
     logger.info(f"[camera_speak_stop] Result: {res}")
     return res
+
+if not os.getenv("CAMXPOSED_HIDE_VOICE_TOOLS"):
+    camera_speak = mcp.tool()(camera_speak)
+    camera_speak_stop = mcp.tool()(camera_speak_stop)
 
 def main():
     import argparse
@@ -1652,14 +1977,31 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.getenv("CAMXPOSED_PORT", "8000")), help="Port to bind for HTTP/SSE")
     args, _ = parser.parse_known_args()
 
+    if hasattr(mcp, "settings"):
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        # Enable stateless HTTP so remote clients (like ChatGPT/OpenAI) can invoke tools
+        # across HTTP requests without requiring an explicit mcp-session-id header
+        mcp.settings.stateless_http = True
+
     if args.transport == "streamable-http":
         from mcp.server.transport_security import TransportSecuritySettings
         sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        mcp.run(transport="streamable-http", host=args.host, port=args.port, transport_security=sec)
+        if hasattr(mcp, "settings"):
+            mcp.settings.transport_security = sec
+        try:
+            mcp.run(transport="streamable-http", host=args.host, port=args.port, transport_security=sec, stateless_http=True)
+        except TypeError:
+            mcp.run(transport="streamable-http")
     elif args.transport == "sse":
         from mcp.server.transport_security import TransportSecuritySettings
         sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        mcp.run(transport="sse", host=args.host, port=args.port, transport_security=sec)
+        if hasattr(mcp, "settings"):
+            mcp.settings.transport_security = sec
+        try:
+            mcp.run(transport="sse", host=args.host, port=args.port, transport_security=sec)
+        except TypeError:
+            mcp.run(transport="sse")
     else:
         mcp.run(transport="stdio")
 

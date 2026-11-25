@@ -60,6 +60,74 @@ export CAMXPOSED_ONVIF_USER="admin"
 export CAMXPOSED_ONVIF_PASS=""
 ```
 
+## ChatGPT Custom Instructions Setup
+
+For optimal performance with ChatGPT Voice and MCP tools, configure your ChatGPT **Custom Instructions** (or Project/GPT System Prompt) with the following exact block:
+
+```text
+You are connected to a physical IP camera via your camera tools/plugins/mcp.
+
+RULES:
+1. SEARCH & EXPLORATION (MANDATORY SUBAGENT): Whenever the user asks you to find, search for, look for, or locate ANY object, item, or person in the room (e.g., "find a chair", "find me something", "look for my keys", "search the room"), you MUST IMMEDIATELY call `spawn_subagent`. DO NOT attempt to search manually using `camera_observe` or `camera_move`. Stay quiet while the subagent works, and only announce the final result when it completes.
+2. NEVER FAKE ACTIONS: If asked to move the camera, inspect, or speak through it, you MUST ACTUALLY EXECUTE the tool. Never roleplay or claim you moved or saw something without running the tool.
+3. MOVEMENT: For explicit single directional moves requested by the user (e.g., "turn left", "look up"), always use maximum speed (8) and at least 700–1000ms. Low speeds are too weak to physically turn the camera motors.
+4. VISION: Use `camera_observe` ONLY to check what is directly in front of the lens right now when asked "what do you see?". Never use it to search around the room, and never guess or hallucinate.
+5. TALKBACK: Only use the camera's speaker when explicitly told to speak or announce into the room. Keep normal conversation in your own voice chat.
+```
+
+## Live Voice Bridge & Visual Subagent (Feature Branch)
+
+This branch adds full-duplex realtime voice communication and autonomous background visual search:
+
+1. **Full-Duplex Live Voice Bridge (`live_voice_bridge.py`)**:
+   - Bridges the camera's RTSP microphone directly to ChatGPT Realtime Voice via WebRTC.
+   - Streams ChatGPT's synthesized voice responses back to the physical camera speaker (Anyka talkback port 8000 / raw PCM/A-law).
+   - Features local client-side Silero VAD (Voice Activity Detection) with instant audio cutoff upon user barge-in.
+   - Supports auto-discovery of ChatGPT session tokens from local browser profiles (Firefox containers) or direct token/cookie injection.
+
+2. **Autonomous Visual Subagent (`subagent_engine.py`)**:
+   - Dispatches a background visual search subagent via `spawn_subagent(search_entity_description="...")`.
+   - Autonomously sweeps the room using ONVIF PTZ, capturing camera snapshots at each waypoint.
+   - Evaluates frames via ChatGPT SSE HTTP stream, detecting entities with canary protection and spatial confirmation.
+   - Automatically stops the camera upon target acquisition and injects a synthesized completion message directly into the live voice session.
+
+3. **Unified Multi-Mode Launcher (`run.py`)**:
+   - Supports `--mode both` (default: MCP server + Live Voice Bridge + Go gateway).
+   - Supports `--mode mcp` (MCP server only).
+   - Supports `--mode live` (Live Voice Bridge only).
+
+### Running the System
+
+Start both the MCP server and Live Voice Bridge:
+```bash
+python3 run.py --mode both
+```
+
+Start only the MCP server (exposed via ngrok for ChatGPT Developer mode / MCP client):
+```bash
+python3 run.py --mode mcp
+```
+
+Start only the Live Voice Bridge:
+```bash
+python3 run.py --mode live
+```
+
+Or run the lightweight standalone MCP launcher:
+```bash
+python3 run_chatgpt_mcp.py
+```
+
+### Environment Variables for Voice Bridge & Subagent
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GATEWAY_PASSWORD` | `AdminPassword2026!` | Password for local WebRTC voice gateway |
+| `VOICE_GATEWAY_DIR` | Auto-detected | Path to local `chatgpt-web-voice` gateway directory |
+| `VOICE_DB_PATH` | Auto-detected | Path to SQLite `voice.db` storing active call sessions |
+| `CAMXPOSED_HIDE_VOICE_TOOLS` | `0` | Set to `1` to hide `camera_speak` from MCP tools when Live Voice Bridge handles audio |
+| `CAMXPOSED_PTZ_DEBOUNCE_SEC` | `25` | Seconds of PTZ movement cooldown after subagent activity |
+
 ## Camera behaviour
 
 - Camera tools automatically use the selected camera.
@@ -78,4 +146,4 @@ export CAMXPOSED_ONVIF_PASS=""
 
 ## Security
 
-The ngrok URL provides connectivity, not authentication. Share it only with trusted MCP clients.
+The ngrok URL provides connectivity, not authentication. Share it only with trusted MCP clients. Never commit private tokens, passwords, or session databases.
