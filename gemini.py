@@ -708,16 +708,17 @@ class GeminiSubagent:
 
                 return False, f"stalled(disp={diag.displacement:.1f}px, diag={diag.summary()[:60]}...)"
 
-            def check_frame_for_target(snapshot_bytes: bytes, context_desc: str) -> tuple[bool, str]:
+            def check_frame_for_target(snapshot_bytes: bytes, context_desc: str) -> tuple[bool, str, Optional[list[int]]]:
                 nonlocal step_count
                 step_count += 1
                 prompt = (
                     f"You are an autonomous persistent visual search agent searching for '{target}' in this physical room using an ONVIF PTZ camera ({context_desc}). "
                     f"Be persistent and thorough. Examine this camera snapshot very carefully. Inspect every surface, desk, table, floor, chair, shelf, and background item. "
                     f"Is '{target}' (or any clear representation/match of it) visible anywhere in this frame? "
-                    f"Respond strictly in JSON format with two fields: "
+                    f"Respond strictly in JSON format with fields: "
                     f"\"status\": either \"FOUND\" (only if target is clearly visible) or \"NOT_FOUND\" (if target is absent), "
-                    f"\"details\": \"concise description of location if found, or what is visible in frame if not found\". "
+                    f"\"details\": \"concise description of location if found, or what is visible in frame if not found\", "
+                    f"\"box_2d\": [ymin, xmin, ymax, xmax] (normalized integers from 0 to 1000 bounding '{target}' if FOUND, or [] if NOT_FOUND). "
                     f"Do not guess or hallucinate."
                 )
                 candidate_models = ["gemini-3-flash-preview", self.model_name, "gemini-3.8-flash"]
@@ -750,34 +751,47 @@ class GeminiSubagent:
                                 continue
 
                         raw_text = (response.text or "").strip()
+                        parsed_box = None
                         try:
                             parsed = json.loads(raw_text)
                             status = str(parsed.get("status", "")).strip().upper()
                             details = str(parsed.get("details", "")).strip()
+                            b = parsed.get("box_2d")
+                            if isinstance(b, list) and len(b) == 4:
+                                try:
+                                    parsed_box = [int(v) for v in b]
+                                except Exception:
+                                    parsed_box = None
                         except Exception:
                             upper_raw = raw_text.upper()
                             status = "NOT_FOUND" if ("NOT_FOUND" in upper_raw or "NOT FOUND" in upper_raw) else ("FOUND" if "FOUND" in upper_raw else "NOT_FOUND")
                             details = raw_text
+                            parsed_box = None
 
-                        logger.info(f"[Subagent] Step {step_count} ({context_desc}, {model}): status={status} - {details[:90]}...")
+                        logger.info(f"[Subagent] Step {step_count} ({context_desc}, {model}): status={status}, box={parsed_box} - {details[:90]}...")
                         if status == "FOUND":
-                            return True, details
-                        return False, details
+                            return True, details, parsed_box
+                        return False, details, None
                     except Exception as e:
                         err_str = str(e)
                         if "503" in err_str or "404" in err_str or "UNAVAILABLE" in err_str or "NOT_FOUND" in err_str or "429" in err_str:
                             logger.warning(f"[Subagent] Model {model} unavailable ({err_str[:60]}), trying next candidate...")
                             continue
                         logger.warning(f"[Subagent] Error querying Gemini vision with {model}: {e}")
-                return False, ""
+                return False, "", None
+
+            found_box: Optional[list[int]] = None
+            latest_snap: Optional[bytes] = None
 
             # 1. Check initial starting view
             initial_snap = capture_camera_snapshot(self.cam)
             if initial_snap:
-                is_hit, details = check_frame_for_target(initial_snap, "initial view")
+                is_hit, details, box = check_frame_for_target(initial_snap, "initial view")
                 if is_hit:
                     found = True
                     found_details = details
+                    found_box = box
+                    latest_snap = initial_snap
                     logger.info(f"[Subagent] TARGET ACQUIRED immediately! {found_details}")
 
             # 2. Span Direction 1: Go RIGHT until physical mechanical endstop (view truly stops changing)
@@ -810,10 +824,12 @@ class GeminiSubagent:
                             logger.debug(f"[Subagent] Right step {right_steps} confirmed move ({reason})")
 
                     prev_snap = curr_snap
-                    is_hit, details = check_frame_for_target(curr_snap, f"panning right step {right_steps}")
+                    is_hit, details, box = check_frame_for_target(curr_snap, f"panning right step {right_steps}")
                     if is_hit:
                         found = True
                         found_details = details
+                        found_box = box
+                        latest_snap = curr_snap
                         logger.info(f"[Subagent] TARGET ACQUIRED while panning right! {found_details}")
                         break
 
@@ -847,17 +863,86 @@ class GeminiSubagent:
                             logger.debug(f"[Subagent] Left step {left_steps} confirmed move ({reason})")
 
                     prev_snap = curr_snap
-                    is_hit, details = check_frame_for_target(curr_snap, f"panning left step {left_steps}")
+                    is_hit, details, box = check_frame_for_target(curr_snap, f"panning left step {left_steps}")
                     if is_hit:
                         found = True
                         found_details = details
+                        found_box = box
+                        latest_snap = curr_snap
                         logger.info(f"[Subagent] TARGET ACQUIRED while panning left! {found_details}")
                         break
 
+            # 4. Fine-Tuned Centering: Adjust camera so target is in the middle 50% of the frame [250, 750]
+            if found and self._is_busy:
+                logger.info("[Subagent] Checking target framing to ensure it is within middle 50% of the frame...")
+                if not found_box and latest_snap:
+                    _, found_details, found_box = check_frame_for_target(latest_snap, "centering box localization")
+
+                curr_box = found_box
+                for fine_step in range(1, 6):
+                    if not self._is_busy or not curr_box:
+                        break
+                    ymin, xmin, ymax, xmax = curr_box
+                    cx = (xmin + xmax) / 2.0
+                    cy = (ymin + ymax) / 2.0
+                    logger.info(f"[Subagent] Framing check {fine_step}/5: target center=(cx={cx:.0f}, cy={cy:.0f}), box={curr_box}")
+
+                    in_x = 250 <= cx <= 750
+                    in_y = 250 <= cy <= 750
+                    if in_x and in_y:
+                        logger.info(f"[Subagent] ✓ Target successfully framed within middle 50% of view (cx={cx:.0f}, cy={cy:.0f})!")
+                        break
+
+                    # Target outside middle 50% - determine fine-tuned direction, duration and speed
+                    move_dir = None
+                    speed = 3
+                    duration_ms = 220
+
+                    if cx < 250:
+                        move_dir = "left"
+                        speed = 3 if cx >= 150 else 4
+                        duration_ms = 200 if cx >= 150 else 320
+                    elif cx > 750:
+                        move_dir = "right"
+                        speed = 3 if cx <= 850 else 4
+                        duration_ms = 200 if cx <= 850 else 320
+                    elif cy < 250:
+                        move_dir = "up"
+                        speed = 2
+                        duration_ms = 180 if cy >= 150 else 250
+                    elif cy > 750:
+                        move_dir = "down"
+                        speed = 2
+                        duration_ms = 180 if cy <= 850 else 250
+
+                    if move_dir:
+                        logger.info(f"[Subagent] Fine-tune nudge: moving {move_dir} (speed={speed}, dur={duration_ms}ms) to center target...")
+                        move_camera(self.cam, direction=move_dir, duration_ms=duration_ms, speed=speed)
+                        time.sleep(1.0)
+
+                        nudge_snap = capture_camera_snapshot(self.cam)
+                        if not nudge_snap:
+                            break
+                        latest_snap = nudge_snap
+                        is_hit, updated_det, updated_box = check_frame_for_target(nudge_snap, f"centering nudge {fine_step}")
+                        if is_hit and updated_box:
+                            curr_box = updated_box
+                            found_details = updated_det
+                        elif is_hit:
+                            found_details = updated_det
+                            logger.info(f"[Subagent] Target remains in view after nudge: {updated_det}")
+                            break
+                        else:
+                            logger.warning(f"[Subagent] Target slipped out of view after {move_dir} nudge. Reversing nudge...")
+                            rev_dir = "right" if move_dir == "left" else ("left" if move_dir == "right" else ("down" if move_dir == "up" else "up"))
+                            move_camera(self.cam, direction=rev_dir, duration_ms=duration_ms, speed=speed)
+                            time.sleep(1.0)
+                            break
+
             # Revert to clean outcome messages
             if found:
-                reverted_msg = f"FOUND: '{target}' was found in the room. Details: {found_details}"
-                spoken = f"{target} mil gayi! Room me target mil gaya hai."
+                reverted_msg = f"FOUND: '{target}' was found and framed in the center of view. Details: {found_details}"
+                spoken = f"{target} mil gayi! Camera ko target par center kar diya hai."
             else:
                 reverted_msg = f"NOT_FOUND: '{target}' was not found after scanning the entire physical span from end to end."
                 spoken = f"Pure kamre me dono taraf dekhne par bhi {target} nahi mili."
