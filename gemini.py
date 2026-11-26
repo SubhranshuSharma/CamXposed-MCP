@@ -632,6 +632,26 @@ class GeminiSubagent:
             lan_engine.record_agent_working(True, "gemini_subagent")
             logger.info(f"[Subagent] Starting dynamic span search for target '{target}'...")
 
+            def is_view_changed(before_bytes: bytes, after_bytes: bytes) -> tuple[bool, str]:
+                """Checks if camera viewpoint actually moved using PtzFeatureStallDetector and pixel difference."""
+                # 1. PtzFeatureStallDetector (ORB-like BRIEF + Harris + NCC fallback)
+                diag = PtzFeatureStallDetector.compare(before_bytes, after_bytes)
+                if diag.view_changed:
+                    return True, f"ptz_feature_detector(disp={diag.displacement:.1f}px, inliers={diag.inliers})"
+                
+                # 2. Robust MAE difference check: large moves (>30-150px) where template search (±16px) 
+                # cannot find consensus must not be falsely treated as stalled.
+                try:
+                    im1 = np.array(Image.open(io.BytesIO(before_bytes)).convert("L").resize((320, 240)), dtype=np.float32)
+                    im2 = np.array(Image.open(io.BytesIO(after_bytes)).convert("L").resize((320, 240)), dtype=np.float32)
+                    mae = float(np.mean(np.abs(im1 - im2)))
+                    if mae >= 6.0:
+                        return True, f"frame_diff_mae({mae:.1f} >= 6.0)"
+                except Exception as ex:
+                    logger.debug(f"[Subagent] Frame difference check error: {ex}")
+                
+                return False, f"stalled(disp={diag.displacement:.1f}px, diag={diag.summary()[:60]}...)"
+
             def check_frame_for_target(snapshot_bytes: bytes, context_desc: str) -> tuple[bool, str]:
                 nonlocal step_count
                 step_count += 1
@@ -644,34 +664,44 @@ class GeminiSubagent:
                     f"\"details\": \"concise description of location if found, or what is visible in frame if not found\". "
                     f"Do not guess or hallucinate."
                 )
-                try:
-                    response = self.client.models.generate_content(
-                        model=self.model_name,
-                        contents=[
-                            types.Part.from_bytes(data=snapshot_bytes, mime_type="image/jpeg"),
-                            prompt
-                        ],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.1,
-                            max_output_tokens=256
-                        )
-                    )
-                    raw_text = (response.text or "").strip()
-                    try:
-                        parsed = json.loads(raw_text)
-                        status = str(parsed.get("status", "")).strip().upper()
-                        details = str(parsed.get("details", "")).strip()
-                    except Exception:
-                        upper_raw = raw_text.upper()
-                        status = "NOT_FOUND" if ("NOT_FOUND" in upper_raw or "NOT FOUND" in upper_raw) else ("FOUND" if "FOUND" in upper_raw else "NOT_FOUND")
-                        details = raw_text
+                candidate_models = [self.model_name, "gemini-3-flash-preview", "gemini-3.8-flash"]
+                # De-duplicate while preserving order
+                models_to_try = list(dict.fromkeys(candidate_models))
 
-                    logger.info(f"[Subagent] Step {step_count} ({context_desc}): status={status} - {details[:90]}...")
-                    if status == "FOUND":
-                        return True, details
-                except Exception as e:
-                    logger.warning(f"[Subagent] Error querying Gemini vision: {e}")
+                for model in models_to_try:
+                    try:
+                        response = self.client.models.generate_content(
+                            model=model,
+                            contents=[
+                                types.Part.from_bytes(data=snapshot_bytes, mime_type="image/jpeg"),
+                                prompt
+                            ],
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                temperature=0.1,
+                                max_output_tokens=256
+                            )
+                        )
+                        raw_text = (response.text or "").strip()
+                        try:
+                            parsed = json.loads(raw_text)
+                            status = str(parsed.get("status", "")).strip().upper()
+                            details = str(parsed.get("details", "")).strip()
+                        except Exception:
+                            upper_raw = raw_text.upper()
+                            status = "NOT_FOUND" if ("NOT_FOUND" in upper_raw or "NOT FOUND" in upper_raw) else ("FOUND" if "FOUND" in upper_raw else "NOT_FOUND")
+                            details = raw_text
+
+                        logger.info(f"[Subagent] Step {step_count} ({context_desc}, {model}): status={status} - {details[:90]}...")
+                        if status == "FOUND":
+                            return True, details
+                        return False, details
+                    except Exception as e:
+                        err_str = str(e)
+                        if "503" in err_str or "404" in err_str or "UNAVAILABLE" in err_str or "NOT_FOUND" in err_str:
+                            logger.warning(f"[Subagent] Model {model} unavailable ({err_str[:60]}), trying next candidate...")
+                            continue
+                        logger.warning(f"[Subagent] Error querying Gemini vision with {model}: {e}")
                 return False, ""
 
             # 1. Check initial starting view
@@ -683,17 +713,16 @@ class GeminiSubagent:
                     found_details = details
                     logger.info(f"[Subagent] TARGET ACQUIRED immediately! {found_details}")
 
-            # 2. Go in Direction 1 (right) until 3 consecutive stalled observations (physical limit)
+            # 2. Span Direction 1: Go RIGHT until physical mechanical endstop (view truly stops changing)
             if not found:
-                logger.info("[Subagent] Panning RIGHT until view stops changing (physical limit)...")
+                logger.info("[Subagent] Panning RIGHT across the room until physical endstop is reached...")
                 prev_snap = initial_snap
                 right_steps = 0
-                max_right_steps = 25
                 right_stall_streak = 0
 
-                while self._is_busy and right_steps < max_right_steps:
+                while self._is_busy:
                     right_steps += 1
-                    logger.info(f"[Subagent] Moving right (1000ms, step {right_steps})...")
+                    logger.info(f"[Subagent] Moving right (step {right_steps})...")
                     move_camera(self.cam, direction="right", duration_ms=1000, speed=8)
                     time.sleep(1.3)
 
@@ -701,18 +730,17 @@ class GeminiSubagent:
                     if not curr_snap:
                         continue
 
-                    # Require 3 consecutive unchanged observations to confirm physical mechanical endstop
                     if prev_snap:
-                        diag = PtzFeatureStallDetector.compare(prev_snap, curr_snap)
-                        if not diag.view_changed:
+                        changed, reason = is_view_changed(prev_snap, curr_snap)
+                        if not changed:
                             right_stall_streak += 1
-                            logger.info(f"[Subagent] Right stall observation streak={right_stall_streak}/3. Diag: {diag.summary()}")
+                            logger.info(f"[Subagent] Right stall observation streak={right_stall_streak}/3 ({reason})")
                             if right_stall_streak >= 3:
-                                logger.info(f"[Subagent] Right limit confirmed after {right_steps} moves (3 consecutive stalled observations). Reversing to left span.")
+                                logger.info(f"[Subagent] Right physical endstop reached after {right_steps} moves. Now reversing to explore complete opposite span to the left.")
                                 break
                         else:
                             right_stall_streak = 0
-                            logger.debug(f"[Subagent] Right step {right_steps} confirmed move: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
+                            logger.debug(f"[Subagent] Right step {right_steps} confirmed move ({reason})")
 
                     prev_snap = curr_snap
                     is_hit, details = check_frame_for_target(curr_snap, f"panning right step {right_steps}")
@@ -722,17 +750,16 @@ class GeminiSubagent:
                         logger.info(f"[Subagent] TARGET ACQUIRED while panning right! {found_details}")
                         break
 
-            # 3. Reverse direction and go in opposite direction (left) until 3 consecutive stalled observations
+            # 3. Span Direction 2: Reverse and pan LEFT until physical mechanical endstop on the other side
             if not found:
-                logger.info("[Subagent] Reversing direction: panning LEFT across entire span until view stops changing...")
+                logger.info("[Subagent] Reversing direction: panning LEFT across entire room span until physical endstop...")
                 prev_snap = capture_camera_snapshot(self.cam)
                 left_steps = 0
-                max_left_steps = 45
                 left_stall_streak = 0
 
-                while self._is_busy and left_steps < max_left_steps:
+                while self._is_busy:
                     left_steps += 1
-                    logger.info(f"[Subagent] Moving left (1000ms, step {left_steps})...")
+                    logger.info(f"[Subagent] Moving left (step {left_steps})...")
                     move_camera(self.cam, direction="left", duration_ms=1000, speed=8)
                     time.sleep(1.3)
 
@@ -740,18 +767,17 @@ class GeminiSubagent:
                     if not curr_snap:
                         continue
 
-                    # Require 3 consecutive unchanged observations to confirm physical mechanical endstop
                     if prev_snap:
-                        diag = PtzFeatureStallDetector.compare(prev_snap, curr_snap)
-                        if not diag.view_changed:
+                        changed, reason = is_view_changed(prev_snap, curr_snap)
+                        if not changed:
                             left_stall_streak += 1
-                            logger.info(f"[Subagent] Left stall observation streak={left_stall_streak}/3. Diag: {diag.summary()}")
+                            logger.info(f"[Subagent] Left stall observation streak={left_stall_streak}/3 ({reason})")
                             if left_stall_streak >= 3:
-                                logger.info(f"[Subagent] Left limit confirmed after {left_steps} moves (3 consecutive stalled observations). Entire physical span exhausted.")
+                                logger.info(f"[Subagent] Left physical endstop reached after {left_steps} moves. Complete room span exhausted.")
                                 break
                         else:
                             left_stall_streak = 0
-                            logger.debug(f"[Subagent] Left step {left_steps} confirmed move: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
+                            logger.debug(f"[Subagent] Left step {left_steps} confirmed move ({reason})")
 
                     prev_snap = curr_snap
                     is_hit, details = check_frame_for_target(curr_snap, f"panning left step {left_steps}")
