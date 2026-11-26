@@ -420,6 +420,47 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         # 3. Successful connection clears rate limit
         self.assertIn("save_account_status(self.account_email, limited=False)", conn_src)
 
+    def test_inactivity_timeout_60s_and_10m_resume_window(self):
+        """Inactivity timeout must default to 60s and session resume window must default to 10m (600s)."""
+        import live_voice_bridge
+        import inspect
+
+        src = inspect.getsource(live_voice_bridge)
+        # 1. 60s default inactivity timeout
+        self.assertIn('os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "60.0")', src)
+
+        # 2. 600s (10m) session resume window
+        self.assertIn('os.getenv("CAMXPOSED_SESSION_RESUME_WINDOW_S", "600.0")', src)
+
+        # 3. Resume logic: <= session_resume_window_s resumes conversation, > starts brand new
+        self.assertIn("standby_elapsed <= session_resume_window_s", src)
+        self.assertIn("Resuming conversation", src)
+        self.assertIn("Starting brand new ChatGPT session", src)
+
+    def test_subagent_search_pauses_inactivity_timer(self):
+        """Subagent active search time must count as agent turn and pause the inactivity timer."""
+        import live_voice_bridge
+        import subagent_engine
+        from unittest.mock import patch, MagicMock
+
+        bridge = live_voice_bridge.LiveVoiceBridge.__new__(live_voice_bridge.LiveVoiceBridge)
+        bridge.chatgpt_state = "listening"
+        bridge.speaker = None
+        bridge.engine = MagicMock()
+        bridge.engine.is_agent_working.return_value = False
+        bridge.engine.get_last_agent_done_time.return_value = 0.0
+
+        # When subagent is NOT busy, agent turn is False
+        with patch.object(subagent_engine.subagent_manager, "is_busy", return_value=False):
+            busy, reason = bridge.is_agent_turn()
+            self.assertFalse(busy)
+
+        # When subagent IS busy searching, agent turn is True ('subagent_searching')
+        with patch.object(subagent_engine.subagent_manager, "is_busy", return_value=True):
+            busy, reason = bridge.is_agent_turn()
+            self.assertTrue(busy)
+            self.assertEqual(reason, "subagent_searching")
+
 
 if __name__ == "__main__":
     unittest.main()

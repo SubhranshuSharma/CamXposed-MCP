@@ -1641,10 +1641,14 @@ class LiveVoiceBridge:
         self.stop_event_subscription()
         self.engine.set_live_session_state(is_active=True, alerts_enabled=False, camera_ip=self.camera_ip)
 
-        # Configurable inactivity timeout (default: 180 seconds = 3 minutes to comfortably allow visual subagent searches)
-        inactivity_limit_s = float(os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "180.0"))
+        # Configurable inactivity timeout (default: 60 seconds of idle silence after agent finishes)
+        inactivity_limit_s = float(os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "60.0"))
+        # Configurable session resume window (default: 600 seconds = 10 minutes to resume the same conversation)
+        session_resume_window_s = float(os.getenv("CAMXPOSED_SESSION_RESUME_WINDOW_S", "600.0"))
         first_connect = True
         should_standby = False
+        standby_start_mono = 0.0
+        resume_session = False
 
         while self.running:
             if not first_connect and should_standby:
@@ -1652,6 +1656,7 @@ class LiveVoiceBridge:
                 self.standby_mode = True
                 self.session_active = False
                 self.wake_event = asyncio.Event()
+                standby_start_mono = time.monotonic()
 
                 # In Standby mode: arm alerts and look for chaos
                 self.engine.set_live_session_state(is_active=False, alerts_enabled=True, camera_ip=self.camera_ip)
@@ -1662,7 +1667,8 @@ class LiveVoiceBridge:
                 logger.info(f"- Inactivity timeout reached (camera idle for > {inactivity_limit_s:.0f}s with agent done).")
                 logger.info("- Continuous VAD active: Listening for voice on camera microphone.")
                 logger.info("- Camera alerts ARMED: Motion and alarm sensors active to trigger wake-up.")
-                logger.info("- Speak into mic OR trigger camera alert to start a fresh chat.")
+                logger.info(f"- 10-Minute Resume Window: Speak within {session_resume_window_s/60:.0f}m to resume conversation context.")
+                logger.info(f"- If silence exceeds {session_resume_window_s/60:.0f}m, the next voice detection starts a new session.")
                 logger.info("===============================================================================")
 
                 # Periodically poll while in Standby to wake up if a background subagent finishes!
@@ -1687,22 +1693,41 @@ class LiveVoiceBridge:
 
                 if not self.running:
                     break
-                logger.info(f">>> WAKING UP (Trigger: {getattr(self, 'wake_reason', 'wake_event')})! Starting fresh ChatGPT session... <<<")
+
+                standby_elapsed = time.monotonic() - standby_start_mono
                 self.standby_mode = False
                 # Immediately disarm alerts
                 self.stop_event_subscription()
                 self.engine.set_live_session_state(is_active=True, alerts_enabled=False, camera_ip=self.camera_ip)
-                # Fresh conversation on wake-up from standby
-                self.upstream_conversation_id = ""
-                self.upstream_parent_message_id = ""
-                self.upstream_voice_session_id = ""
+
+                wake_trigger = getattr(self, "wake_reason", "wake_event")
+                if standby_elapsed <= session_resume_window_s and getattr(self, "upstream_conversation_id", None):
+                    # Person returned within 10 minutes -> resume the same session!
+                    resume_session = True
+                    logger.info(
+                        f">>> WAKING UP (Trigger: {wake_trigger}) after {standby_elapsed:.1f}s idle "
+                        f"(within {session_resume_window_s/60:.0f}m window) -> Resuming conversation ({self.upstream_conversation_id})... <<<"
+                    )
+                else:
+                    # Person returned after 10 minutes -> start a new session altogether!
+                    resume_session = False
+                    reason_desc = f">{session_resume_window_s/60:.0f}m idle ({standby_elapsed:.1f}s)" if standby_elapsed > session_resume_window_s else "new conversation"
+                    logger.info(
+                        f">>> WAKING UP (Trigger: {wake_trigger}) after {standby_elapsed:.1f}s idle "
+                        f"({reason_desc}) -> Starting brand new ChatGPT session... <<<"
+                    )
+                    self.upstream_conversation_id = ""
+                    self.upstream_parent_message_id = ""
+                    self.upstream_voice_session_id = ""
             elif not first_connect:
                 # Unexpected disconnection (DataChannel closed or network blip during active chat):
                 # Auto-reconnect immediately to resume the live session!
                 logger.info(">>> Unintended disconnect during active session — reconnecting immediately to resume conversation... <<<")
                 await asyncio.sleep(0.1)
+                resume_session = True
+            else:
+                resume_session = False
 
-            is_midcall_reconnect = bool(not first_connect and not should_standby)
             first_connect = False
             self.disconnect_due_to_inactivity = False
             heartbeat_task = None
@@ -1712,7 +1737,7 @@ class LiveVoiceBridge:
                 self.stop_event_subscription()
                 self.engine.set_live_session_state(is_active=True, alerts_enabled=False, camera_ip=self.camera_ip)
 
-                await self.connect_session(resume=is_midcall_reconnect)
+                await self.connect_session(resume=resume_session)
                 self.session_active = True
                 self.mark_talk_activity(source="connect")
 
