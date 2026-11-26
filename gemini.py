@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import audioop
 import getpass
+import io
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import av
 import numpy as np
+from PIL import Image
 
 try:
     from google import genai
@@ -634,22 +636,21 @@ class GeminiSubagent:
 
             def is_view_changed(before_bytes: bytes, after_bytes: bytes) -> tuple[bool, str]:
                 """Checks if camera viewpoint actually moved using PtzFeatureStallDetector and pixel difference."""
-                # 1. PtzFeatureStallDetector (ORB-like BRIEF + Harris + NCC fallback)
                 diag = PtzFeatureStallDetector.compare(before_bytes, after_bytes)
-                if diag.view_changed:
+                # If feature detector found displacement >= 1.8px, viewpoint definitely changed!
+                if diag.view_changed or diag.displacement >= 1.8:
                     return True, f"ptz_feature_detector(disp={diag.displacement:.1f}px, inliers={diag.inliers})"
-                
-                # 2. Robust MAE difference check: large moves (>30-150px) where template search (±16px) 
-                # cannot find consensus must not be falsely treated as stalled.
+
+                # Also verify pixel Mean Absolute Error (MAE) for large moves
                 try:
                     im1 = np.array(Image.open(io.BytesIO(before_bytes)).convert("L").resize((320, 240)), dtype=np.float32)
                     im2 = np.array(Image.open(io.BytesIO(after_bytes)).convert("L").resize((320, 240)), dtype=np.float32)
                     mae = float(np.mean(np.abs(im1 - im2)))
                     if mae >= 6.0:
-                        return True, f"frame_diff_mae({mae:.1f} >= 6.0)"
+                        return True, f"frame_diff_mae({mae:.1f} >= 6.0, disp={diag.displacement:.1f}px)"
                 except Exception as ex:
-                    logger.debug(f"[Subagent] Frame difference check error: {ex}")
-                
+                    logger.warning(f"[Subagent] Frame difference check error: {ex}")
+
                 return False, f"stalled(disp={diag.displacement:.1f}px, diag={diag.summary()[:60]}...)"
 
             def check_frame_for_target(snapshot_bytes: bytes, context_desc: str) -> tuple[bool, str]:
