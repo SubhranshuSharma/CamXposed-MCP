@@ -228,6 +228,24 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertIn("अलमारी नहीं मिली", rev_nf)
         self.assertIn("नहीं मिली", spk_nf)
 
+    def test_live_voice_bridge_webrtc_resilience(self):
+        """LiveVoiceBridge must decouple DataChannel close from peer connection and configure STUN."""
+        import live_voice_bridge
+        import inspect
+
+        src = inspect.getsource(live_voice_bridge)
+        # 1. STUN server configuration present
+        self.assertIn("stun:stun.l.google.com:19302", src)
+        self.assertIn("RTCConfiguration", src)
+        self.assertIn("RTCIceServer", src)
+
+        # 2. dc.on("close") must NOT trigger reconnect
+        self.assertNotIn('Realtime DataChannel (oai-events) closed! Triggering auto-reconnect', src)
+        self.assertIn('_attach_datachannel_handlers', src)
+
+        # 3. relay_message_processed handler present
+        self.assertIn('relay_message_processed', src)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,7 +55,7 @@ from lan_engine import LanEngine, LanCamera
 import av
 import numpy as np
 import onnxruntime as ort
-from aiortc import RTCPeerConnection, RTCSessionDescription, AudioStreamTrack
+from aiortc import RTCPeerConnection, RTCSessionDescription, AudioStreamTrack, RTCConfiguration, RTCIceServer
 from aiortc.mediastreams import MediaStreamError
 
 import aioice.ice
@@ -1103,6 +1103,15 @@ class LiveVoiceBridge:
 
     def send_dc_event(self, event_obj: dict):
         """Sends a JSON control event wrapped in data_message over the negotiated oai-events DataChannel."""
+        if self.pc and getattr(self.pc, "connectionState", "") not in ("failed", "closed"):
+            if not self.dc or getattr(self.dc, "readyState", "") != "open":
+                try:
+                    logger.info("[LiveVoiceBridge] Reopening negotiated oai-events DataChannel on active WebRTC session...")
+                    self.dc = self.pc.createDataChannel("oai-events", id=0, negotiated=True)
+                    self._attach_datachannel_handlers(self.dc)
+                except Exception as e:
+                    logger.warning(f"Failed to recreate DataChannel: {e}")
+
         if self.dc and getattr(self.dc, "readyState", "") == "open":
             try:
                 wrapped = json.dumps({
@@ -1113,6 +1122,8 @@ class LiveVoiceBridge:
                 logger.info(f"Sent Realtime DC event: {event_obj.get('type')}")
             except Exception as e:
                 logger.warning(f"Failed to send DC event: {e}")
+        else:
+            logger.warning(f"Could not send DC event {event_obj.get('type')}: DataChannel not open (state={getattr(self.dc, 'readyState', 'none')})")
 
     def send_relay_text(self, text: str):
         """Sends a text prompt or notification to ChatGPT over the oai-events DataChannel."""
@@ -1205,38 +1216,9 @@ class LiveVoiceBridge:
         else:
             logger.debug(f"[VAD] User speaking, speaker idle; normal speech turn.")
 
-    async def connect_session(self, resume: bool = False):
-        """Initiates WebRTC session with ChatGPT Realtime via the local Go gateway.
-        When resume is False (default), guarantees a fresh conversation is started."""
-        self.loop = asyncio.get_running_loop()
-        self.login_gateway()
-        self.sync_token_if_needed()
-
-        self.voice_session_id = ""
-        if not resume:
-            # Server restart or fresh session: strictly start a new conversation
-            self.upstream_conversation_id = ""
-            self.upstream_parent_message_id = ""
-            self.upstream_voice_session_id = ""
-            self.local_conversation_id = ""
-
-        self.reconnect_event = asyncio.Event()
-        self.pc = RTCPeerConnection()
-        self.speaker = CameraSpeakerStreamer(self.camera_ip, on_speech_active=self.mark_talk_activity)
-        if self.mic_capture:
-            self.mic_capture.clear_buffer()
-            self.mic_track = CameraMicTrack(self.mic_capture)
-        else:
-            rtsp_url = f"rtsp://admin:@{self.camera_ip}:554/ch0_0.264"
-            self.mic_capture = CameraMicCapture(rtsp_url, on_speech=self.on_speech_detected)
-            self.mic_track = CameraMicTrack(self.mic_capture)
-
-        self.pc.addTrack(self.mic_track)
-        
-        # Negotiated DataChannel "oai-events" (id=0) as specified by ChatGPT WebRTC protocol
-        self.dc = self.pc.createDataChannel("oai-events", id=0, negotiated=True)
-
-        @self.dc.on("open")
+    def _attach_datachannel_handlers(self, dc):
+        """Attaches state, text, and telemetry handlers to the negotiated oai-events DataChannel."""
+        @dc.on("open")
         def on_open():
             logger.info(">>> ChatGPT Realtime DataChannel (oai-events) connected! Live voice active. <<<")
             self.session_active = True
@@ -1261,17 +1243,17 @@ class LiveVoiceBridge:
             except Exception as e:
                 logger.debug(f"Failed to send session.update: {e}")
 
-        @self.dc.on("close")
+        @dc.on("close")
         def on_close():
-            logger.warning(">>> ChatGPT Realtime DataChannel (oai-events) closed! Triggering auto-reconnect... <<<")
-            self.reconnect_event.set()
+            logger.info("[LiveVoiceBridge] Realtime DataChannel (oai-events) closed (WebRTC media tracks remain active).")
+            if self.dc is dc:
+                self.dc = None
 
-        @self.dc.on("error")
+        @dc.on("error")
         def on_error(err):
-            logger.error(f">>> ChatGPT Realtime DataChannel (oai-events) error: {err}! Triggering auto-reconnect... <<<")
-            self.reconnect_event.set()
+            logger.warning(f"[LiveVoiceBridge] Realtime DataChannel (oai-events) error: {err}")
 
-        @self.dc.on("message")
+        @dc.on("message")
         def on_message(msg):
             try:
                 m = json.loads(msg)
@@ -1302,6 +1284,13 @@ class LiveVoiceBridge:
                     if p.get("parent_message_id"):
                         self.upstream_parent_message_id = p["parent_message_id"]
                     self.update_gateway_context()
+                elif t == "relay_message_processed":
+                    p = m.get("payload") or m
+                    mid = p.get("message_id")
+                    if mid:
+                        self.upstream_parent_message_id = mid
+                        self.update_gateway_context()
+                    logger.info(f"[LiveVoiceBridge] Relay message acknowledged by ChatGPT (message_id={mid})")
                 elif t == "chat_message_delta":
                     self.mark_talk_activity(source="delta")
                     self.last_agent_stream_time = time.monotonic()
@@ -1367,6 +1356,41 @@ class LiveVoiceBridge:
             except Exception as e:
                 logger.warning(f"DC message parse error: {e}")
 
+    async def connect_session(self, resume: bool = False):
+        """Initiates WebRTC session with ChatGPT Realtime via the local Go gateway.
+        When resume is False (default), guarantees a fresh conversation is started."""
+        self.loop = asyncio.get_running_loop()
+        self.login_gateway()
+        self.sync_token_if_needed()
+
+        self.voice_session_id = ""
+        if not resume:
+            # Server restart or fresh session: strictly start a new conversation
+            self.upstream_conversation_id = ""
+            self.upstream_parent_message_id = ""
+            self.upstream_voice_session_id = ""
+            self.local_conversation_id = ""
+
+        self.reconnect_event = asyncio.Event()
+        rtc_config = RTCConfiguration(iceServers=[
+            RTCIceServer(urls=["stun:stun.l.google.com:19302", "stun:stun4.l.google.com:19302"])
+        ])
+        self.pc = RTCPeerConnection(configuration=rtc_config)
+        self.speaker = CameraSpeakerStreamer(self.camera_ip, on_speech_active=self.mark_talk_activity)
+        if self.mic_capture:
+            self.mic_capture.clear_buffer()
+            self.mic_track = CameraMicTrack(self.mic_capture)
+        else:
+            rtsp_url = f"rtsp://admin:@{self.camera_ip}:554/ch0_0.264"
+            self.mic_capture = CameraMicCapture(rtsp_url, on_speech=self.on_speech_detected)
+            self.mic_track = CameraMicTrack(self.mic_capture)
+
+        self.pc.addTrack(self.mic_track)
+        
+        # Negotiated DataChannel "oai-events" (id=0) as specified by ChatGPT WebRTC protocol
+        self.dc = self.pc.createDataChannel("oai-events", id=0, negotiated=True)
+        self._attach_datachannel_handlers(self.dc)
+
         @self.pc.on("track")
         def on_track(track):
             if track.kind == "audio":
@@ -1377,13 +1401,13 @@ class LiveVoiceBridge:
         @self.pc.on("iceconnectionstatechange")
         def on_ice():
             logger.info(f"WebRTC ICE connection state: {self.pc.iceConnectionState}")
-            if self.pc.iceConnectionState in ("failed", "disconnected", "closed"):
+            if self.pc.iceConnectionState in ("failed", "closed"):
                 self.reconnect_event.set()
 
         @self.pc.on("connectionstatechange")
         def on_state():
             logger.info(f"WebRTC connection state: {self.pc.connectionState}")
-            if self.pc.connectionState in ("failed", "disconnected", "closed"):
+            if self.pc.connectionState in ("failed", "closed"):
                 self.reconnect_event.set()
 
         # WebRTC Offer
