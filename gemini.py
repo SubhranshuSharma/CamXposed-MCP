@@ -182,23 +182,78 @@ CRITICAL INSTRUCTIONS:
 """
 
 
-def get_gemini_api_key() -> str:
-    """Retrieves Gemini API key from environment, saved config, or user prompt."""
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if api_key:
-        return api_key
+def check_key_quota_available(key: str) -> bool:
+    """Checks if a Gemini API key has remaining quota by performing a minimal pre-flight ping."""
+    import requests
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={key}"
+        res = requests.post(url, json={"contents": [{"parts": [{"text": "ping"}]}]}, timeout=4.0)
+        if res.status_code == 200:
+            return True
+        err_msg = ""
+        try:
+            err_msg = res.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if res.status_code == 429 or "quota" in err_msg.lower() or "resource_exhausted" in err_msg.lower():
+            logger.warning(f"Key ...{key[-6:]} quota exceeded (HTTP 429): {err_msg[:80]}")
+            return False
+        # Other errors (e.g. invalid key)
+        if res.status_code in (400, 403):
+            logger.warning(f"Key ...{key[-6:]} rejected (HTTP {res.status_code}): {err_msg[:80]}")
+            return False
+        # If response was temporary error or other status, still assume usable
+        return True
+    except Exception as e:
+        logger.debug(f"Pre-flight quota check warning for key ...{key[-6:]}: {e}")
+        return True
 
+
+def get_gemini_api_key() -> str:
+    """
+    Retrieves Gemini API key with multi-key fallback.
+    Keys are loaded in order of priority (environment variable, then config file line-by-line).
+    Each key is checked for quota availability at start of session; if quota is exhausted,
+    the next key in the list is automatically tried.
+    """
+    candidates: list[str] = []
+
+    # 1. Environment variable
+    env_keys = os.getenv("GEMINI_API_KEY", "").strip()
+    if env_keys:
+        for k in env_keys.replace(",", "\n").splitlines():
+            cleaned = k.strip()
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+
+    # 2. Config file (supports multiple keys, one per line)
     if KEY_FILE.is_file():
         try:
             saved = KEY_FILE.read_text(encoding="utf-8").strip()
-            if saved:
-                return saved
+            for line in saved.splitlines():
+                cleaned = line.strip()
+                if cleaned and not cleaned.startswith("#") and cleaned not in candidates:
+                    candidates.append(cleaned)
         except Exception as e:
-            logger.warning(f"Failed to read saved Gemini API key from {KEY_FILE}: {e}")
+            logger.warning(f"Failed to read saved Gemini API keys from {KEY_FILE}: {e}")
+
+    # Check candidates for available quota
+    if candidates:
+        logger.info(f"Loaded {len(candidates)} candidate Gemini API key(s). Checking quota availability...")
+        for idx, key in enumerate(candidates, 1):
+            if check_key_quota_available(key):
+                logger.info(f"✓ Using Gemini API key [{idx}/{len(candidates)}] (...{key[-6:]}) with active quota.")
+                return key
+            logger.warning(f"Gemini API key [{idx}/{len(candidates)}] (...{key[-6:]}) has exhausted quota. Checking next...")
+
+        # If all candidates had quota errors, return first as fallback
+        logger.warning("All candidate keys reported quota exceeded. Using top priority key as fallback.")
+        return candidates[0]
 
     if sys.stdin.isatty():
         print("\n--- Google Gemini API Key Setup ---")
         print("A Gemini API key is required for Gemini Live & Vision subagent.")
+        print("You can enter multiple keys (or save multiple keys line-by-line in ~/.config/camxposed-mcp/gemini_api_key).")
         print("Get your API key at: https://aistudio.google.com/apikey")
         try:
             entered = getpass.getpass("Enter your GEMINI_API_KEY (hidden): ").strip()
@@ -209,7 +264,7 @@ def get_gemini_api_key() -> str:
 
         if entered:
             try:
-                KEY_FILE.write_text(entered, encoding="utf-8")
+                KEY_FILE.write_text(entered + "\n", encoding="utf-8")
                 KEY_FILE.chmod(0o600)
                 logger.info(f"Saved Gemini API key securely to {KEY_FILE}")
             except Exception as e:
@@ -217,8 +272,8 @@ def get_gemini_api_key() -> str:
             return entered
 
     raise RuntimeError(
-        "GEMINI_API_KEY environment variable is not set and no key file was found. "
-        "Set GEMINI_API_KEY or save it in ~/.config/camxposed-mcp/gemini_api_key"
+        "GEMINI_API_KEY environment variable is not set and no valid key was found in "
+        "~/.config/camxposed-mcp/gemini_api_key"
     )
 
 
@@ -1106,56 +1161,78 @@ class GeminiLiveBridge:
         logger.info(f"Connecting to Gemini Live API ({self.live_model}, voice={self.voice_name})...")
         lan_engine.set_live_session_state(True, camera_ip=self.camera_ip)
 
-        while self.running:
+        try:
+            while self.running:
+                try:
+                    async with self.client.aio.live.connect(model=self.live_model, config=config) as session:
+                        self.session = session
+                        self.is_session_active = True
+                        self.last_user_activity = time.time()
+                        logger.info("✓ Gemini Live API connected and active! Listening for voice...")
+                        mic_task = asyncio.create_task(self._mic_send_loop())
+                        recv_task = asyncio.create_task(self._receive_loop())
+
+                        # Initial greeting prompt in Hindi so the model speaks first in Hindi
+                        try:
+                            await session.send_realtime_input(
+                                text="[SESSION_INITIALIZED] Greet the user in Hindi warmly and concisely in 1 short sentence: 'नमस्ते! मैं कैमरा असिस्टेंट हूँ, बताइए मैं आपकी क्या सहायता कर सकता हूँ?'"
+                            )
+                        except Exception as e:
+                            logger.debug(f"Initial greeting trigger error: {e}")
+
+                        # Monitor inactivity
+                        while self.running and not recv_task.done():
+                            await asyncio.sleep(2.0)
+                            now = time.time()
+
+                            # Inactivity timeout (paused if subagent is busy searching)
+                            if not self.subagent.is_busy():
+                                silence_elapsed = now - self.last_user_activity
+                                if silence_elapsed > self.inactivity_timeout_s:
+                                    logger.info(
+                                        f"Inactivity timeout reached ({self.inactivity_timeout_s:.0f}s silence). "
+                                        "Disconnecting session to preserve API quota."
+                                    )
+                                    break
+
+                        self.is_session_active = False
+                        mic_task.cancel()
+                        recv_task.cancel()
+
+                    # Standby: wait for user speech before reconnecting
+                    logger.info("Session in standby. Listening for user speech onset to resume...")
+                    while self.running and not self.mic.speech_active:
+                        await asyncio.sleep(0.5)
+
+                    if self.running:
+                        logger.info("User speech detected! Resuming Gemini Live session...")
+
+                except Exception as e:
+                    logger.warning(f"Gemini Live session disconnected: {e}. Reconnecting in 3s...")
+                    await asyncio.sleep(3.0)
+        finally:
+            self.running = False
+            lan_engine.set_live_session_state(False)
+            if self.mic:
+                self.mic.close()
+            if self.speaker:
+                self.speaker.close()
+
+    def stop(self):
+        """Stops the bridge cleanly."""
+        self.running = False
+        if self.session:
             try:
-                async with self.client.aio.live.connect(model=self.live_model, config=config) as session:
-                    self.session = session
-                    self.is_session_active = True
-                    self.last_user_activity = time.time()
-                    logger.info("✓ Gemini Live API connected and active! Listening for voice...")
-                    mic_task = asyncio.create_task(self._mic_send_loop())
-                    recv_task = asyncio.create_task(self._receive_loop())
-
-                    # Initial greeting prompt in Hindi so the model speaks first in Hindi
-                    try:
-                        await session.send_realtime_input(
-                            text="[SESSION_INITIALIZED] Greet the user in Hindi warmly and concisely in 1 short sentence: 'नमस्ते! मैं कैमरा असिस्टेंट हूँ, बताइए मैं आपकी क्या सहायता कर सकता हूँ?'"
-                        )
-                    except Exception as e:
-                        logger.debug(f"Initial greeting trigger error: {e}")
-
-                    # Monitor inactivity
-                    while self.running and not recv_task.done():
-                        await asyncio.sleep(2.0)
-                        now = time.time()
-
-                        # Inactivity timeout (paused if subagent is busy searching)
-                        if not self.subagent.is_busy():
-                            silence_elapsed = now - self.last_user_activity
-                            if silence_elapsed > self.inactivity_timeout_s:
-                                logger.info(
-                                    f"Inactivity timeout reached ({self.inactivity_timeout_s:.0f}s silence). "
-                                    "Disconnecting session to preserve API quota."
-                                )
-                                break
-
-                    self.is_session_active = False
-                    mic_task.cancel()
-                    recv_task.cancel()
-
-                # Standby: wait for user speech before reconnecting
-                logger.info("Session in standby. Listening for user speech onset to resume...")
-                while self.running and not self.mic.speech_active:
-                    await asyncio.sleep(0.5)
-
-                if self.running:
-                    logger.info("User speech detected! Resuming Gemini Live session...")
-
-            except Exception as e:
-                logger.warning(f"Gemini Live session disconnected: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
-
-        lan_engine.set_live_session_state(False)
+                # Cancel running session tasks if loop is running
+                if self.loop and self.loop.is_running():
+                    for task in asyncio.all_tasks(self.loop):
+                        task.cancel()
+            except Exception:
+                pass
+        if self.mic:
+            self.mic.close()
+        if self.speaker:
+            self.speaker.close()
 
 
 def main():
@@ -1180,14 +1257,24 @@ def main():
         voice_name=args.voice
     )
 
+    sig_count = 0
     def handle_sig(sig, frame):
+        nonlocal sig_count
+        sig_count += 1
         logger.info("Shutting down Gemini Live Voice Bridge...")
-        bridge.running = False
+        bridge.stop()
+        if sig_count >= 2:
+            os._exit(0)
 
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
 
-    asyncio.run(bridge.run_session())
+    try:
+        asyncio.run(bridge.run_session())
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        bridge.stop()
 
 
 if __name__ == "__main__":
