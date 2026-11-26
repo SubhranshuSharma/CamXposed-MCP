@@ -138,6 +138,48 @@ def get_gemini_api_key() -> str:
     )
 
 
+def resolve_camera(camera_ip: str) -> LanCamera:
+    """Finds or constructs a LanCamera instance for the given camera IP."""
+    with lan_engine.lock:
+        if camera_ip in lan_engine.discovered_cameras:
+            return lan_engine.discovered_cameras[camera_ip]
+        for c in lan_engine.discovered_cameras.values():
+            if c.ip == camera_ip or c.id == camera_ip:
+                return c
+
+    user = os.getenv("CAMXPOSED_ONVIF_USER", "admin")
+    pwd = os.getenv("CAMXPOSED_ONVIF_PASS", "")
+    try:
+        cam = lan_engine.interrogate_onvif(camera_ip, username=user, password=pwd)
+        if cam:
+            with lan_engine.lock:
+                lan_engine.discovered_cameras[camera_ip] = cam
+            return cam
+    except Exception as e:
+        logger.debug(f"ONVIF interrogation failed for {camera_ip}: {e}")
+
+    stream_uri = f"rtsp://{camera_ip}:554/ch0_0.264"
+    cam = LanCamera(
+        id=f"lan_{camera_ip.replace('.', '_')}",
+        ip=camera_ip,
+        username=user,
+        password=pwd,
+        stream_uri=stream_uri,
+        snapshot_url=f"http://{camera_ip}:8888/snapshot"
+    )
+    with lan_engine.lock:
+        lan_engine.discovered_cameras[camera_ip] = cam
+    return cam
+
+
+def move_camera(cam: LanCamera, direction: str, duration_ms: int = 800, speed: int = 8) -> dict[str, Any]:
+    return lan_engine.ptz_move(cam, direction=direction, speed=speed, duration_ms=duration_ms)
+
+
+def capture_camera_snapshot(cam: LanCamera) -> Optional[bytes]:
+    return lan_engine.capture_snapshot(cam)
+
+
 class GeminiCameraMicCapture:
     """Captures RTSP microphone audio, downsamples to 16kHz PCM mono, and runs Silero VAD."""
 
@@ -357,6 +399,7 @@ class GeminiSubagent:
     def __init__(self, client: genai.Client, camera_ip: str, model_name: str = GEMINI_CHAT_MODEL):
         self.client = client
         self.camera_ip = camera_ip
+        self.cam = resolve_camera(camera_ip)
         self.model_name = model_name
         self._is_busy = False
         self._current_target = ""
@@ -411,14 +454,14 @@ class GeminiSubagent:
         ]
 
         try:
-            lan_engine.set_agent_working(True)
+            lan_engine.record_agent_working(True, "gemini_subagent")
             logger.info(f"[Subagent] Commencing room sweep for target '{target}' ({len(sweep_waypoints)} waypoints)...")
 
             for idx, (move_dir, move_ms) in enumerate(sweep_waypoints, 1):
                 if move_ms > 0:
                     logger.info(f"[Subagent] Step {idx}/{len(sweep_waypoints)}: Moving {move_dir} ({move_ms}ms)...")
-                    lan_engine.send_ptz_move(
-                        camera_id=self.camera_ip,
+                    move_camera(
+                        self.cam,
                         direction=move_dir,
                         duration_ms=move_ms,
                         speed=8
@@ -428,7 +471,7 @@ class GeminiSubagent:
                     time.sleep(0.5)
 
                 # Capture real snapshot from camera
-                snapshot_bytes = lan_engine.get_snapshot(camera_id=self.camera_ip)
+                snapshot_bytes = capture_camera_snapshot(self.cam)
                 if not snapshot_bytes:
                     logger.warning(f"[Subagent] Failed to capture snapshot at waypoint {idx}; continuing")
                     continue
@@ -482,7 +525,7 @@ class GeminiSubagent:
         finally:
             with self._lock:
                 self._is_busy = False
-            lan_engine.set_agent_working(False)
+            lan_engine.record_agent_working(False, "gemini_subagent")
             logger.info(f"[Subagent] Search finished. Outcome: {reverted_msg}")
             if on_finish:
                 try:
@@ -503,6 +546,7 @@ class GeminiLiveBridge:
         inactivity_timeout_s: float = INACTIVITY_TIMEOUT_S
     ):
         self.camera_ip = camera_ip
+        self.cam = resolve_camera(camera_ip)
         self.api_key = api_key
         self.live_model = live_model
         self.voice_name = voice_name
@@ -664,16 +708,16 @@ class GeminiLiveBridge:
             direction = args.get("direction", "left")
             duration_ms = int(args.get("duration_ms", 800))
             speed = int(args.get("speed", 8))
-            lan_engine.send_ptz_move(
-                camera_id=self.camera_ip,
+            res = move_camera(
+                self.cam,
                 direction=direction,
                 duration_ms=duration_ms,
                 speed=speed
             )
-            response_dict = {"status": "ok", "moved": direction, "duration_ms": duration_ms}
+            response_dict = {"status": "ok", "moved": direction, "duration_ms": duration_ms, "result": res}
 
         elif name == "camera_observe":
-            snapshot = lan_engine.get_snapshot(camera_id=self.camera_ip)
+            snapshot = capture_camera_snapshot(self.cam)
             response_dict = {
                 "status": "snapshot_captured",
                 "bytes": len(snapshot) if snapshot else 0,
@@ -743,8 +787,10 @@ class GeminiLiveBridge:
     async def run_session(self):
         """Runs the live voice bridge session with auto-reconnect and inactivity timeout."""
         self.loop = asyncio.get_running_loop()
-        cam = lan_engine.get_camera(self.camera_ip)
-        rtsp_url = cam.rtsp_url if cam else f"rtsp://admin:@{self.camera_ip}:554/live/ch0"
+        self.cam = resolve_camera(self.camera_ip)
+        user = self.cam.username or "admin"
+        pwd = self.cam.password or ""
+        rtsp_url = f"rtsp://{user}:{pwd}@{self.camera_ip}:554/ch0_0.264"
 
         self.mic = GeminiCameraMicCapture(
             rtsp_url=rtsp_url,

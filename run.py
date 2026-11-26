@@ -951,6 +951,29 @@ def main() -> int:
 
     target_token = args.token
     target_account_email = args.account_email
+    if mode in ("live", "both") and provider == "gemini":
+        gemini_key_file = Path(os.path.expanduser("~/.config/camxposed-mcp/gemini_api_key"))
+        has_key = bool(os.getenv("GEMINI_API_KEY") or (gemini_key_file.is_file() and gemini_key_file.read_text(encoding="utf-8").strip()))
+        if not has_key and sys.stdin.isatty():
+            say("\n--- Google Gemini API Key Setup ---")
+            say("A Gemini API key is required for Gemini Live & Vision subagent.")
+            say("Get your API key at: https://aistudio.google.com/apikey")
+            try:
+                entered = getpass.getpass("Enter your GEMINI_API_KEY (hidden): ").strip()
+                if not entered:
+                    entered = input("Enter your GEMINI_API_KEY: ").strip()
+            except Exception:
+                entered = input("Enter your GEMINI_API_KEY: ").strip()
+            if entered:
+                try:
+                    gemini_key_file.parent.mkdir(parents=True, exist_ok=True)
+                    gemini_key_file.write_text(entered, encoding="utf-8")
+                    gemini_key_file.chmod(0o600)
+                    os.environ["GEMINI_API_KEY"] = entered
+                    say(f"✓ Saved Gemini API key to {gemini_key_file}")
+                except Exception as e:
+                    say(f"! Could not save API key to file: {e}")
+
     if mode in ("live", "both") and provider == "chatgpt" and not target_token:
         try:
             from live_voice_bridge import select_chatgpt_account
