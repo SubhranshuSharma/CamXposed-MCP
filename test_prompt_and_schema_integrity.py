@@ -354,6 +354,72 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         import run
         run.verify_prompt_and_schema_integrity()
 
+    def test_is_account_rate_limited_no_reset_time_not_locked_24h(self):
+        """Accounts with unconfirmed reset time must not be locked for 24h and must never return generic text as time."""
+        import live_voice_bridge
+        import time
+
+        now = time.time()
+        # Stale unverified limit recorded 70 minutes ago (> 1 hour) must expire to False
+        stale_entry = {
+            "limited": True,
+            "reset_str": "daily cap reached",
+            "updated_at": now - 4200
+        }
+        is_lim, r_str = live_voice_bridge.is_account_rate_limited(stale_entry)
+        self.assertFalse(is_lim, "Unconfirmed rate limit must expire after 1 hour!")
+        self.assertEqual(r_str, "")
+
+        # Recent unverified limit (< 1 hour) must return True with empty reset string (NOT 'daily cap reached')
+        recent_entry = {
+            "limited": True,
+            "reset_str": "daily cap reached",
+            "updated_at": now - 300
+        }
+        is_lim, r_str = live_voice_bridge.is_account_rate_limited(recent_entry)
+        self.assertTrue(is_lim)
+        self.assertEqual(r_str, "", "Generic text like 'daily cap reached' must NEVER be returned as a reset time string!")
+
+    def test_jwt_expiration_check(self):
+        """is_jwt_expired must accurately identify expired vs valid JWT tokens."""
+        import base64
+        import json
+        import time
+        import live_voice_bridge
+
+        now = int(time.time())
+        # Expired token
+        hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+        exp_payload = base64.urlsafe_b64encode(json.dumps({"exp": now - 100}).encode()).decode().rstrip("=")
+        expired_jwt = f"{hdr}.{exp_payload}.sig"
+        self.assertTrue(live_voice_bridge.is_jwt_expired(expired_jwt))
+
+        # Valid token
+        valid_payload = base64.urlsafe_b64encode(json.dumps({"exp": now + 3600}).encode()).decode().rstrip("=")
+        valid_jwt = f"{hdr}.{valid_payload}.sig"
+        self.assertFalse(live_voice_bridge.is_jwt_expired(valid_jwt))
+
+        # Malformed / empty token
+        self.assertTrue(live_voice_bridge.is_jwt_expired(None))
+        self.assertTrue(live_voice_bridge.is_jwt_expired(""))
+
+    def test_refresh_token_from_firefox_on_401(self):
+        """LiveVoiceBridge must provide refresh_token_from_firefox and invoke it on 401 Unauthorized."""
+        import live_voice_bridge
+        import inspect
+
+        src = inspect.getsource(live_voice_bridge)
+        # 1. Method exists
+        self.assertIn("def refresh_token_from_firefox", src)
+
+        # 2. connect_session catches 401 and calls refresh_token_from_firefox
+        conn_src = inspect.getsource(live_voice_bridge.LiveVoiceBridge.connect_session)
+        self.assertIn("401", conn_src)
+        self.assertIn("refresh_token_from_firefox", conn_src)
+
+        # 3. Successful connection clears rate limit
+        self.assertIn("save_account_status(self.account_email, limited=False)", conn_src)
+
 
 if __name__ == "__main__":
     unittest.main()

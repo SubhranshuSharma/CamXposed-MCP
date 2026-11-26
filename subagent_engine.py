@@ -675,10 +675,16 @@ class SubagentExecutionManager:
             import live_voice_bridge
             accs = live_voice_bridge.discover_firefox_accounts()
             if accs:
-                # Prefer non-limited accounts
+                # Prefer non-limited accounts with valid (non-expired) tokens
                 for a in accs:
-                    if not a.get("is_limited"):
-                        return a.get("access_token")
+                    tok = a.get("access_token")
+                    if not a.get("is_limited") and tok and not live_voice_bridge.is_jwt_expired(tok):
+                        return tok
+                # Fallback to any account with valid token
+                for a in accs:
+                    tok = a.get("access_token")
+                    if tok and not live_voice_bridge.is_jwt_expired(tok):
+                        return tok
                 return accs[0].get("access_token")
         except Exception as e:
             logger.warning(f"[Subagent] Could not get access token: {e}")

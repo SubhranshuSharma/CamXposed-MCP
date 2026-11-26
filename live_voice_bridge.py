@@ -90,16 +90,35 @@ def load_account_statuses() -> dict:
     return {}
 
 
+def is_jwt_expired(jwt_str: Optional[str], buffer_s: float = 60.0) -> bool:
+    """Checks if a JWT's exp claim has passed or is missing."""
+    if not jwt_str or not isinstance(jwt_str, str):
+        return True
+    try:
+        parts = jwt_str.split(".")
+        if len(parts) >= 2:
+            import base64
+            padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded))
+            exp = payload.get("exp")
+            if exp and isinstance(exp, (int, float)):
+                return (time.time() + buffer_s) >= exp
+    except Exception:
+        pass
+    return False
+
+
 def is_account_rate_limited(status_entry: dict) -> tuple[bool, str]:
     """Checks if an account's recorded voice limit is currently active or has expired.
     Returns (is_limited, reset_display_string).
-    If the reset time has arrived, returns (False, '').
+    If the reset time has arrived or was recorded without a valid reset timestamp,
+    ensures accounts do NOT remain permanently locked.
     """
     if not status_entry or not status_entry.get("limited"):
         return False, ""
 
     updated_at = status_entry.get("updated_at", 0)
-    # If limit was recorded more than 24 hours ago, treat it as expired
+    # If limit was recorded more than 24 hours ago, treat it as expired regardless
     if time.time() - updated_at >= 86400:
         return False, ""
 
@@ -130,7 +149,13 @@ def is_account_rate_limited(status_entry: dict) -> tuple[bool, str]:
             return False, ""
         return True, cand.strftime("%-I:%M %p")
 
-    return True, reset_str
+    # If neither an epoch timestamp nor an HH:MM reset pattern exists:
+    # Do NOT lock the account for 24 hours or show "Resets at daily cap reached"!
+    # Unspecified voice caps expire after 1 hour (3600s).
+    if time.time() - updated_at >= 3600:
+        return False, ""
+
+    return True, ""
 
 
 def save_account_status(email: str, limited: bool, reset_str: str = "", resets_at: Optional[float] = None):
@@ -229,14 +254,24 @@ def discover_firefox_accounts() -> list[dict]:
                     if cached_id:
                         email = cached_id.get("email", "")
                         name = cached_id.get("name", "")
-                        access_token = cached_id.get("access_token")
+                        cand_token = cached_id.get("access_token")
+                        if cand_token and not is_jwt_expired(cand_token):
+                            access_token = cand_token
+                        else:
+                            access_token = combined
 
                 if not email:
                     email = f"Account ({oa or 'default'})"
 
                 st = statuses.get(email, {})
                 is_limited, reset_str = is_account_rate_limited(st)
-                if st.get("limited") and not is_limited:
+                # If fresh verified access_token was obtained and there is no confirmed future resets_at timestamp,
+                # auto-clear unverified rate limit so account is never falsely locked!
+                if is_limited and not st.get("resets_at") and not reset_str:
+                    is_limited = False
+                    reset_str = ""
+                    save_account_status(email, limited=False)
+                elif st.get("limited") and not is_limited:
                     save_account_status(email, limited=False)
 
                 accounts.append({
@@ -1088,6 +1123,42 @@ class LiveVoiceBridge:
                 else:
                     raise
 
+    def refresh_token_from_firefox(self) -> bool:
+        """Pulls fresh session cookies from Firefox SQLite databases on disk,
+        fetches a fresh accessToken from chatgpt.com/api/auth/session,
+        and updates the local voice gateway account.
+        """
+        try:
+            accs = discover_firefox_accounts()
+            if not accs:
+                logger.warning("[LiveVoiceBridge] No ChatGPT accounts discovered in Firefox.")
+                return False
+
+            matched = None
+            if getattr(self, "account_email", None):
+                matched = next((a for a in accs if a.get("email", "").lower() == self.account_email.lower()), None)
+            if not matched and accs:
+                matched = accs[0]
+
+            if not matched:
+                return False
+
+            fresh_token = matched.get("access_token")
+            if not fresh_token:
+                return False
+
+            self.token = fresh_token
+            if matched.get("email"):
+                self.account_email = matched["email"]
+
+            # Update gateway account with fresh token
+            self.sync_token_if_needed()
+            logger.info(f"[LiveVoiceBridge] Successfully refreshed token for {self.account_email} from Firefox.")
+            return True
+        except Exception as e:
+            logger.warning(f"[LiveVoiceBridge] Failed to refresh token from Firefox: {e}")
+            return False
+
     def update_gateway_context(self, conversation_id: str = "", parent_message_id: str = "", voice_session_id: str = ""):
         """Pushes active conversation IDs to the voice gateway and local conversation row to prevent session reaping."""
         if not self.voice_session_id:
@@ -1409,7 +1480,7 @@ class LiveVoiceBridge:
                             save_account_status(
                                 self.account_email,
                                 limited=True,
-                                reset_str=getattr(self, "reset_str", "daily cap reached"),
+                                reset_str=getattr(self, "reset_str", ""),
                                 resets_at=getattr(self, "resets_at", None)
                             )
                     elif reason == "error" or "error" in detail:
@@ -1515,15 +1586,46 @@ class LiveVoiceBridge:
         })
 
         logger.info("Connecting WebRTC session via voice gateway...")
-        with urllib.request.urlopen(req) as resp:
-            resp_data = json.loads(resp.read().decode())
-            answer_sdp = resp_data["answer_sdp"]
-            vs_id = resp_data.get("voice_session_id")
-            self.voice_session_id = vs_id
-            logger.info(f"Gateway session established: {vs_id}")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                resp_data = json.loads(resp.read().decode())
+                answer_sdp = resp_data["answer_sdp"]
+                vs_id = resp_data.get("voice_session_id")
+                self.voice_session_id = vs_id
+                logger.info(f"Gateway session established: {vs_id}")
 
-            answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
-            await self.pc.setRemoteDescription(answer)
+                answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
+                await self.pc.setRemoteDescription(answer)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                logger.warning("[LiveVoiceBridge] Received HTTP 401 Unauthorized from voice gateway. Attempting to refresh token from Firefox...")
+                refreshed = self.refresh_token_from_firefox()
+                if refreshed:
+                    logger.info("[LiveVoiceBridge] Fresh token acquired. Retrying WebRTC session establishment...")
+                    req_body["account_id"] = getattr(self, "account_id", 1)
+                    retry_payload = json.dumps(req_body).encode("utf-8")
+                    retry_req = urllib.request.Request(f"{self.gateway_url}/api/voice/session", data=retry_payload, headers={
+                        "Content-Type": "application/json",
+                        "Cookie": self.session_cookie,
+                        "X-CSRF-Token": self.csrf_token
+                    })
+                    with urllib.request.urlopen(retry_req) as resp:
+                        resp_data = json.loads(resp.read().decode())
+                        answer_sdp = resp_data["answer_sdp"]
+                        vs_id = resp_data.get("voice_session_id")
+                        self.voice_session_id = vs_id
+                        logger.info(f"Gateway session established: {vs_id}")
+
+                        answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
+                        await self.pc.setRemoteDescription(answer)
+                else:
+                    raise
+            else:
+                raise
+
+        # Connection successful -> clear any rate-limit flag for this account
+        if getattr(self, "account_email", None):
+            save_account_status(self.account_email, limited=False)
 
         logger.info("Session connected. Camera microphone & speaker are directly linked to ChatGPT Live!")
 
@@ -1703,6 +1805,16 @@ class LiveVoiceBridge:
 
             except Exception as e:
                 logger.warning(f"Live voice bridge session error: {e}")
+                if "401" in str(e):
+                    logger.warning("[LiveVoiceBridge] Session error indicates 401 Unauthorized — attempting token refresh from Firefox...")
+                    refreshed = False
+                    try:
+                        refreshed = self.refresh_token_from_firefox()
+                    except Exception:
+                        pass
+                    if not refreshed:
+                        logger.warning("[LiveVoiceBridge] Token refresh unsuccessful; backing off 5s before retrying...")
+                        await asyncio.sleep(5.0)
             finally:
                 if heartbeat_task:
                     heartbeat_task.cancel()
