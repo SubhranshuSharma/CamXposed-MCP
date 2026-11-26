@@ -246,6 +246,32 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         # 3. relay_message_processed handler present
         self.assertIn('relay_message_processed', src)
 
+    def test_vad_force_resume_and_speech_retention(self):
+        """VAD detection must forcefully resume/start sessions and retain speech buffer."""
+        import live_voice_bridge
+        import inspect
+
+        src = inspect.getsource(live_voice_bridge)
+        # 1. retain_recent_speech must be implemented and called on speech detection and session connect
+        self.assertIn("def retain_recent_speech", src)
+        self.assertIn("retain_recent_speech", src)
+
+        # 2. on_speech_detected must check dc and pc states and force reconnect if closed
+        self.assertIn("VAD Force-Resume", src)
+        self.assertIn("reconnect_event.set", src)
+
+        # 3. pending_relay_text must queue subagent outcomes when dc is closed
+        self.assertIn("pending_relay_text", src)
+
+        # 4. Verify buffer retention logic on mock capture
+        capture = live_voice_bridge.CameraMicCapture.__new__(live_voice_bridge.CameraMicCapture)
+        capture.lock = live_voice_bridge.threading.Lock()
+        # 3 seconds of 48k 16-bit mono = 3 * 96000 = 288,000 bytes
+        capture.mic_pcm_48k = bytearray(b"\x01" * 288000)
+        capture.retain_recent_speech(keep_ms=2500)
+        # 2500ms = 240,000 bytes
+        self.assertEqual(len(capture.mic_pcm_48k), 240000)
+
 
 if __name__ == "__main__":
     unittest.main()

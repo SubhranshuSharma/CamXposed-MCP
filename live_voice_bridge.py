@@ -414,9 +414,10 @@ class CameraMicCapture:
     Persists across sessions so VAD can continuously listen and wake up ChatGPT from Standby.
     """
 
-    def __init__(self, rtsp_url: str, on_speech=None):
+    def __init__(self, rtsp_url: str, on_speech=None, on_speech_ended=None):
         self.rtsp_url = rtsp_url
         self.on_speech = on_speech
+        self.on_speech_ended = on_speech_ended
         self.running = True
         self.lock = threading.Lock()
         self.mic_pcm_48k = bytearray()
@@ -498,15 +499,20 @@ class CameraMicCapture:
                         if self.speech_active and (now - self.last_speech_time) > self.vad_silence_s:
                             self.speech_active = False
                             logger.info(f"[Silero VAD] Speech turn ended ({self.vad_silence_s:.1f}s silence gap).")
+                            if self.on_speech_ended:
+                                try:
+                                    self.on_speech_ended()
+                                except Exception:
+                                    pass
 
                     # 4. Enqueue 48kHz audio into real-time buffer
                     with self.lock:
                         self.mic_pcm_48k.extend(raw_48k)
-                        # Keep a healthy jitter buffer (up to ~800ms) to prevent audio chopping / frame drops.
-                        # Only trim if consumer falls behind (> 1000ms), safely retaining latest 240ms.
-                        max_buf_bytes = 1920 * 50  # 1000ms
+                        # Keep a healthy buffer (up to 4.0s) so speech triggering wake-up/reconnect is fully preserved.
+                        # Only trim if consumer falls behind (> 4000ms), safely retaining latest 2500ms.
+                        max_buf_bytes = 1920 * 200  # 4000ms
                         if len(self.mic_pcm_48k) > max_buf_bytes:
-                            trim_target = 1920 * 12  # 240ms
+                            trim_target = 1920 * 125  # 2500ms
                             del self.mic_pcm_48k[:(len(self.mic_pcm_48k) - trim_target)]
 
                 container.close()
@@ -521,6 +527,13 @@ class CameraMicCapture:
                 del self.mic_pcm_48k[:frame_bytes]
                 return chunk
         return None
+
+    def retain_recent_speech(self, keep_ms: int = 2500):
+        """Retains recent audio (default 2.5s) so speech triggering wake-up/reconnect is fed to ChatGPT."""
+        with self.lock:
+            keep_bytes = (48000 * 2 // 1000) * keep_ms  # 96 bytes per ms = 240,000 bytes for 2500ms
+            if len(self.mic_pcm_48k) > keep_bytes:
+                del self.mic_pcm_48k[:(len(self.mic_pcm_48k) - keep_bytes)]
 
     def clear_buffer(self):
         with self.lock:
@@ -832,6 +845,7 @@ class LiveVoiceBridge:
         self.wake_reason: str = ""
         self.wake_detail: str = ""
         self.pending_wake_alert: Optional[dict] = None
+        self.pending_relay_text: Optional[str] = None
         self.mic_capture: Optional[CameraMicCapture] = None
         self.disconnect_due_to_inactivity = False
 
@@ -908,16 +922,58 @@ class LiveVoiceBridge:
     def on_speech_detected(self, prob: float):
         """Callback from persistent CameraMicCapture when Silero VAD evaluates speech."""
         now = time.monotonic()
-        if self.session_active:
+        self.last_vad_speech_time = now
+
+        # Retain speech buffer so words spoken by user to wake up or resume are preserved
+        if self.mic_capture:
+            self.mic_capture.retain_recent_speech(keep_ms=2500)
+
+        def _handle_speech():
+            # 1. Standby mode or session inactive -> forcefully wake up and start/resume
+            if self.standby_mode or not self.session_active:
+                logger.info(f"[VAD Force-Resume] Speech detected on camera mic (prob={prob:.2f}) while standby/inactive! Forcefully starting/resuming session...")
+                self.trigger_wake_up(reason="vad", detail=f"User voice detected on camera mic (prob={prob:.2f})")
+                if hasattr(self, "wake_event") and self.wake_event:
+                    self.wake_event.set()
+                if hasattr(self, "reconnect_event") and self.reconnect_event:
+                    self.reconnect_event.set()
+                return
+
+            # 2. In active session, check if transport is actually healthy.
+            # If DataChannel is closed or peer connection not connected, OpenAI hung up or dropped session -> force resume!
+            is_dc_alive = bool(self.dc and getattr(self.dc, "readyState", "") == "open")
+            pc_state = getattr(self.pc, "connectionState", "")
+            if not is_dc_alive or pc_state in ("failed", "disconnected", "closed"):
+                logger.warning(f"[VAD Force-Resume] User speech detected (prob={prob:.2f}) but session transport is stale/closed (dc_open={is_dc_alive}, pc={pc_state})! Forcefully resuming session...")
+                if hasattr(self, "reconnect_event") and self.reconnect_event:
+                    self.reconnect_event.set()
+                return
+
+            # 3. Active healthy session: barge-in if speaker is playing
             self.mark_talk_activity(source="vad")
             self.on_barge_in()
-        elif self.standby_mode:
-            logger.info(f"[VAD Wake-up] Speech detected on camera mic (prob={prob:.2f}) while in Standby! Starting fresh session...")
-            self.trigger_wake_up(reason="vad", detail=f"User voice detected on camera mic (prob={prob:.2f})")
+
+        if hasattr(self, "loop") and self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(_handle_speech)
+        else:
+            _handle_speech()
+
+    def on_speech_ended(self):
+        """Callback from CameraMicCapture when a speech turn ends (1.8s silence)."""
+        logger.debug("[LiveVoiceBridge] User speech turn ended.")
 
     def trigger_wake_up(self, reason: str, detail: str, alert_event: Optional[dict] = None):
         """Wakes up the bridge from Standby mode to initiate a fresh ChatGPT session."""
-        if not self.standby_mode or self.session_active:
+        if not self.standby_mode and self.session_active:
+            is_dc_alive = bool(self.dc and getattr(self.dc, "readyState", "") == "open")
+            pc_state = getattr(self.pc, "connectionState", "")
+            if is_dc_alive and pc_state not in ("failed", "disconnected", "closed"):
+                return
+            logger.warning("[Trigger Wake-up] Session was marked active but transport is stale; forcing resume...")
+            if hasattr(self, "loop") and self.loop and self.loop.is_running():
+                self.loop.call_soon_threadsafe(self.reconnect_event.set)
+            else:
+                self.reconnect_event.set()
             return
         self.wake_reason = reason
         self.wake_detail = detail
@@ -1243,9 +1299,16 @@ class LiveVoiceBridge:
             except Exception as e:
                 logger.debug(f"Failed to send session.update: {e}")
 
+            # Dispatch deferred subagent outcome if one was queued while reconnecting
+            if getattr(self, "pending_relay_text", None):
+                notice_to_send = self.pending_relay_text
+                self.pending_relay_text = None
+                logger.info(f"[LiveVoiceBridge] Dispatching pending subagent outcome to newly opened DataChannel...")
+                self.send_relay_text(notice_to_send)
+
         @dc.on("close")
         def on_close():
-            logger.info("[LiveVoiceBridge] Realtime DataChannel (oai-events) closed (WebRTC media tracks remain active).")
+            logger.info("[LiveVoiceBridge] Realtime DataChannel (oai-events) closed by upstream server.")
             if self.dc is dc:
                 self.dc = None
 
@@ -1378,11 +1441,11 @@ class LiveVoiceBridge:
         self.pc = RTCPeerConnection(configuration=rtc_config)
         self.speaker = CameraSpeakerStreamer(self.camera_ip, on_speech_active=self.mark_talk_activity)
         if self.mic_capture:
-            self.mic_capture.clear_buffer()
+            self.mic_capture.retain_recent_speech(keep_ms=2500)
             self.mic_track = CameraMicTrack(self.mic_capture)
         else:
             rtsp_url = f"rtsp://admin:@{self.camera_ip}:554/ch0_0.264"
-            self.mic_capture = CameraMicCapture(rtsp_url, on_speech=self.on_speech_detected)
+            self.mic_capture = CameraMicCapture(rtsp_url, on_speech=self.on_speech_detected, on_speech_ended=self.on_speech_ended)
             self.mic_track = CameraMicTrack(self.mic_capture)
 
         self.pc.addTrack(self.mic_track)
@@ -1464,7 +1527,7 @@ class LiveVoiceBridge:
 
         # 1. Start persistent RTSP microphone capture & Silero VAD (listens 24/7)
         rtsp_url = f"rtsp://admin:@{self.camera_ip}:554/ch0_0.264"
-        self.mic_capture = CameraMicCapture(rtsp_url, on_speech=self.on_speech_detected)
+        self.mic_capture = CameraMicCapture(rtsp_url, on_speech=self.on_speech_detected, on_speech_ended=self.on_speech_ended)
 
         # 2. Alerts start DISABLED (only enabled in Standby mode)
         self.stop_event_subscription()
@@ -1587,8 +1650,13 @@ class LiveVoiceBridge:
                                     if not notice:
                                         from subagent_engine import _format_hindi_outcome
                                         notice, _ = _format_hindi_outcome(task_title, bool(found), conclusion)
-                                    logger.info(f"[LiveVoiceBridge] Subagent search completed (status={status_tag})! Relaying concise Hindi outcome to ChatGPT live session...")
-                                    self.send_relay_text(notice)
+                                    is_dc_open = bool(self.dc and getattr(self.dc, "readyState", "") == "open")
+                                    if is_dc_open:
+                                        self.send_relay_text(notice)
+                                    else:
+                                        logger.warning(f"[LiveVoiceBridge] DataChannel closed when subagent completed! Queuing Hindi outcome and forcefully resuming session...")
+                                        self.pending_relay_text = notice
+                                        self.reconnect_event.set()
                         except Exception:
                             pass
 
