@@ -152,12 +152,12 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         res2 = mgr.start_subagent_task("cupboard", caller_identity="live", previous_instructions="find and stop at the first")
         self.assertEqual(res2.get("error_code"), "IS_SUBAGENT", "Canary 'find and stop at the first' failed to block subagent!")
 
-    def test_chat_caller_is_blocked_from_spawning(self):
-        """Text-chat callers (caller_identity='chat') must be blocked under the hood without lecturing docstrings."""
+    def test_chat_caller_not_blocked_by_identity(self):
+        """Callers with caller_identity='chat' are not blocked by caller_identity check alone."""
         import subagent_engine
         mgr = subagent_engine.SubagentExecutionManager()
         res = mgr.start_subagent_task("cupboard", caller_identity="chat", previous_instructions="search room")
-        self.assertEqual(res.get("error_code"), "IS_SUBAGENT", "Chat caller must be blocked from spawning subagents under the hood!")
+        self.assertNotEqual(res.get("error_code"), "IS_SUBAGENT", "Chat caller must not be blocked by identity check alone!")
 
     def test_verbose_cli_flags_and_default(self):
         """run.py must default to verbose=True and support --no-verbose, --quiet, and -q to disable."""

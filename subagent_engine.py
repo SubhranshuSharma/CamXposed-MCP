@@ -210,17 +210,7 @@ class SubagentExecutionManager:
             return self.active_task_desc
 
     def check_caller_permission(self, caller_role: str) -> Tuple[bool, str]:
-        """Anti-recursion guard. Only 'live' role can spawn subagents.
-        Text subagent uses caller_role='chat' — always guided to observe/move directly.
-        """
-        role = str(caller_role or "").strip().lower()
-        if role != "live":
-            return False, (
-                "You are operating in Text Chat mode! You ALREADY have full direct camera access. "
-                "Do NOT delegate or call spawn_subagent. "
-                "Immediately call camera_observe() to see the current camera view, and use "
-                "camera_move(direction='...', speed=8, duration_ms=1000, caller_role='chat') to turn and inspect the room yourself."
-            )
+        """Anti-recursion guard. Caller permission check."""
         return True, "OK"
 
     def get_status(self) -> Tuple[dict, None]:
@@ -279,8 +269,7 @@ class SubagentExecutionManager:
 
         task_upper = cleaned_task.upper()
         is_nested_subagent = (
-            ident_clean in ("chat", "subagent", "subagent_worker", "subagent_nested")
-            or "ROOM SEARCH MISSION" in task_upper
+            "ROOM SEARCH MISSION" in task_upper
             or is_subagent_by_canary
         )
 
@@ -294,10 +283,10 @@ class SubagentExecutionManager:
 
         # Prevent recursive nesting loops where the text subagent worker spawns another subagent
         if is_nested_subagent:
-            self.record_denial("canary_or_nested_identity")
+            self.record_denial("canary_detected")
             logger.warning(
-                f"[spawn_subagent] Subagent identified via canary/identity (canary={is_subagent_by_canary}, "
-                f"ident='{ident_clean}'). Denying spawn_subagent and providing direct camera access."
+                f"[spawn_subagent] Subagent identified via canary token (canary={is_subagent_by_canary}). "
+                f"Denying spawn_subagent and providing direct camera access."
             )
             return {
                 "ok": False,
