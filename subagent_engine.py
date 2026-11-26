@@ -93,9 +93,9 @@ def _announce_on_camera_speaker(camera_id: Optional[str], text: str):
                 if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", raw):
                     cam_ip = raw
                 elif raw.startswith("lan_"):
-                    c = lan_engine.get_camera(raw)
-                    if c and c.ip:
-                        cam_ip = c.ip
+                    cand_ip = raw.removeprefix("lan_").replace("_", ".")
+                    if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", cand_ip):
+                        cam_ip = cand_ip
 
             has_devanagari = bool(re.search(r"[\u0900-\u097F]", text))
             voice = "hi-IN-MadhurNeural" if has_devanagari else "en-IN-PrabhatNeural"
@@ -274,12 +274,12 @@ class SubagentExecutionManager:
         # If the calling agent quotes either token in previous_instructions or task, it is caught as a subagent!
         prev_inst_lower = (previous_instructions or "").lower()
         task_lower = (search_entity_description or "").lower()
-        CANARY_TOKENS = ["chrysanthemum", "find and stop at the first"]
+        CANARY_TOKENS = ["chrysanthemum", "find and stop at the first", "visual search subagent"]
         is_subagent_by_canary = any(tok in prev_inst_lower or tok in task_lower for tok in CANARY_TOKENS)
 
         task_upper = cleaned_task.upper()
         is_nested_subagent = (
-            ident_clean in ("subagent", "subagent_worker", "subagent_nested")
+            ident_clean in ("chat", "subagent", "subagent_worker", "subagent_nested")
             or "ROOM SEARCH MISSION" in task_upper
             or is_subagent_by_canary
         )
@@ -305,10 +305,12 @@ class SubagentExecutionManager:
                 "error_code": "IS_SUBAGENT",
                 "status": "direct_camera_mode",
                 "message": (
-                    "PERMISSION DENIED: You are the visual search subagent! Do NOT call spawn_subagent. "
+                    "PERMISSION DENIED: You are the visual search subagent! DO NOT call spawn_subagent. "
+                    "NO BACKGROUND TASK WAS STARTED. You must execute the search yourself right now. "
                     "You have direct camera access: an initial camera snapshot image is attached below. "
-                    "Now IMMEDIATELY call camera_move(direction='left', speed=8, duration_ms=1000) or camera_move(direction='right', speed=8, duration_ms=1000) "
-                    "to exhaust the full span of each direction, inspect each view, and conclude with FOUND or NOT FOUND."
+                    "Inspect the attached image. If target is not found or not centered, IMMEDIATELY call camera_move(direction='left', speed=8, duration_ms=1000) "
+                    "or camera_move(direction='right', speed=8, duration_ms=1000) to scan the room. "
+                    "Do NOT say that search was started — you must perform the search now and conclude with FOUND or NOT FOUND."
                 )
             }
 
@@ -328,10 +330,16 @@ class SubagentExecutionManager:
                 )
                 return {
                     "ok": False,
+                    "error": "PERMISSION_DENIED",
                     "error_code": "IS_SUBAGENT",
+                    "status": "direct_camera_mode",
                     "message": (
-                        "You are already the visual search subagent! Do not call spawn_subagent. "
-                        "Here is a fresh camera snapshot frame. Use camera_move and camera_observe to find the object."
+                        "PERMISSION DENIED: You are already the visual search subagent! DO NOT call spawn_subagent. "
+                        "NO BACKGROUND TASK WAS STARTED. You must execute the search yourself right now. "
+                        "Here is a fresh camera snapshot frame attached below. "
+                        "Inspect the attached image. If target is not found or not centered, IMMEDIATELY call camera_move(direction='left', speed=8, duration_ms=1000) "
+                        "or camera_move(direction='right', speed=8, duration_ms=1000) to scan the room. "
+                        "Do NOT say that search was started — you must perform the search now and conclude with FOUND or NOT FOUND."
                     )
                 }
 
@@ -340,10 +348,14 @@ class SubagentExecutionManager:
                 elapsed = int(now - self.active_task_start_time)
                 return {
                     "ok": False,
-                    "status": "busy",
-                    "error": (
-                        "RECURSION DETECTED: You are the subagent! Use the camera move and camera observe to find the object. "
-                        "Do NOT call spawn_subagent again."
+                    "error": "PERMISSION_DENIED",
+                    "error_code": "IS_SUBAGENT",
+                    "status": "direct_camera_mode",
+                    "message": (
+                        "PERMISSION DENIED: You are already the visual search subagent! DO NOT call spawn_subagent. "
+                        "NO BACKGROUND TASK WAS STARTED. You must execute the search yourself right now. "
+                        "Call camera_move(direction='left', speed=8, duration_ms=1000) or camera_move(direction='right', speed=8, duration_ms=1000) and camera_observe() to find the object. "
+                        "Do NOT say that search was started — you must perform the search now and conclude with FOUND or NOT FOUND."
                     )
                 }
             self.last_spawn_time = now
@@ -694,8 +706,13 @@ class SubagentExecutionManager:
             return self._post_to_chatgpt_web_fallback(task)
 
         # 2. Extract clean object description and build exact prompt:
-        obj_desc = _extract_clean_object_description(task)
-        prompt = f"[Project Chrysanthemum] Find and stop at the first {obj_desc} you find in the room, with target in middle of frame. use camxposed mcp and make sure to exaust the full span of each left and right direction and return FOUND/NOT FOUND, use camera_move not spawn_subagent, be persistent"
+        prompt = (
+            f"[Project Chrysanthemum] You are the camera visual search subagent. Directly control the camera using camera_observe() and camera_move() to scan the room for: {obj_desc}. "
+            f"Sweep and exhaust the full viewing span in both left and right directions using camera_move(direction='left', speed=8, duration_ms=1000) and camera_move(direction='right', speed=8, duration_ms=1000). "
+            f"If you spot {obj_desc}, center it in the camera frame and reply with FOUND along with its position. "
+            f"If you search the full room and cannot spot it, reply with NOT FOUND. "
+            f"CRITICAL: DO NOT call spawn_subagent (you ARE the subagent; spawn_subagent is strictly disabled for you). You must execute camera_move and camera_observe yourself. Be persistent."
+        )
 
         conversation_id = None
         final_reply = ""
