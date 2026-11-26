@@ -577,6 +577,279 @@ def select_camera_via_ws_discovery() -> str:
     return chosen_ip
 
 
+
+class LiveActionStreamer:
+    """Tails server.log and bridge.log in real-time, streaming high-level camera actions and tool calls."""
+
+    PATTERNS: list[tuple[re.Pattern, Any, str]] = [
+        # Camera PTZ moves
+        (
+            re.compile(r"\[camera_move\] Moving camera (\S+): direction=(\w+), speed=(\d+), duration_ms=(\d+)"),
+            lambda m: f"[CAMERA MOVE] Direction: {m.group(2).upper()} | Speed: {m.group(3)} | Duration: {m.group(4)}ms",
+            "cyan",
+        ),
+        (
+            re.compile(r"\[camera_move\] PTZ completed"),
+            lambda m: "[CAMERA MOVE] Movement completed & view settled",
+            "cyan",
+        ),
+        (
+            re.compile(r"\[camera_ptz\] Action: (.*)"),
+            lambda m: f"[CAMERA PTZ] Action: {m.group(1)}",
+            "cyan",
+        ),
+        # Camera Observe
+        (
+            re.compile(r"\[camera_observe\] Capturing frame for camera (\S+).*width=(\d+)"),
+            lambda m: f"[CAMERA OBSERVE] Capturing snapshot frame (width: {m.group(2)})...",
+            "blue",
+        ),
+        (
+            re.compile(r"\[camera_observe\] Returning native JPEG image \((\d+) bytes\)"),
+            lambda m: f"[CAMERA OBSERVE] Snapshot captured ({int(m.group(1))/1024:.1f} KB JPEG)",
+            "blue",
+        ),
+        (
+            re.compile(r"\[observe\] Native LAN snapshot captured for camera (\S+): (\d+) bytes in ([\d.]+)s"),
+            lambda m: f"[CAMERA OBSERVE] High-speed native snapshot ({int(m.group(2))/1024:.1f} KB in {m.group(3)}s)",
+            "blue",
+        ),
+        (
+            re.compile(r"\[observe\] Fast fallback frame captured for camera (\S+): (\d+) bytes in ([\d.]+)s"),
+            lambda m: f"[CAMERA OBSERVE] Snapshot captured ({int(m.group(2))/1024:.1f} KB in {m.group(3)}s)",
+            "blue",
+        ),
+        # Camera Audio
+        (
+            re.compile(r"\[camera_listen\] Listening to camera (\S+) for ([\d.]+)s"),
+            lambda m: f"[CAMERA LISTEN] Capturing audio sample ({m.group(2)}s)...",
+            "blue",
+        ),
+        (
+            re.compile(r"\[camera_listen\] Done listening"),
+            lambda m: "[CAMERA LISTEN] Audio capture complete",
+            "blue",
+        ),
+        # Speaker / Audio Out
+        (
+            re.compile(r"\[camera_speak\] Speaking through camera (\S+).*?: '([^']+)'"),
+            lambda m: f"[CAMERA SPEAK] Speaking: \"{m.group(2)}\"",
+            "magenta",
+        ),
+        (
+            re.compile(r"\[camera_speak_stop\] Stopping speech"),
+            lambda m: "[CAMERA SPEAK] Speech playback stopped",
+            "magenta",
+        ),
+        (
+            re.compile(r"\[camera_speaker_volume\] Updated and persisted speaker volume to (\d+)%"),
+            lambda m: f"[SPEAKER VOLUME] Volume updated to {m.group(1)}%",
+            "magenta",
+        ),
+        (
+            re.compile(r"\[AnykaLanSpeaker\] Connected directly to Anyka speaker TCP port 28772"),
+            lambda m: "[SPEAKER] Connected to camera TCP port 28772",
+            "magenta",
+        ),
+        (
+            re.compile(r"\[AnykaLanSpeaker\] Playback (\d+) completed: sent (\d+) bytes"),
+            lambda m: f"[SPEAKER] Audio playback finished ({int(m.group(2))/1024:.1f} KB sent)",
+            "magenta",
+        ),
+        # Subagent Visual Search
+        (
+            re.compile(r"\[spawn_subagent\] AUDIT: entity='([^']+)'"),
+            lambda m: f"[SUBAGENT] Target requested: \"{m.group(1)}\"",
+            "yellow",
+        ),
+        (
+            re.compile(r"\[Subagent\] Starting visual search mission: '([^']+)'"),
+            lambda m: f"[SUBAGENT] Sweeping room for target: \"{m.group(1)}\"",
+            "yellow",
+        ),
+        (
+            re.compile(r"\[Subagent\] Step (\d+): Calling camera_move\(direction='([^']+)'"),
+            lambda m: f"[SUBAGENT] Step {m.group(1)}: Sweeping {m.group(2).upper()}...",
+            "yellow",
+        ),
+        (
+            re.compile(r"\[Subagent\] Inspecting frame with vision"),
+            lambda m: "[SUBAGENT] Inspecting camera view with visual model...",
+            "yellow",
+        ),
+        (
+            re.compile(r"\[Subagent\] Done '([^']+)' in ([\d.]+)s\. found=(True|False)"),
+            lambda m: f"[SUBAGENT] Mission finished in {m.group(2)}s -> FOUND: {m.group(3)}",
+            "yellow",
+        ),
+        (
+            re.compile(r"\[Subagent\] Announcing search outcome directly on camera speaker: '([^']+)'"),
+            lambda m: f"[SUBAGENT] Announcing result: \"{m.group(1)[:75]}...\"",
+            "yellow",
+        ),
+        (
+            re.compile(r"\[Subagent\] Spoke search outcome on camera speaker"),
+            lambda m: "[SUBAGENT] Spoken announcement finished",
+            "yellow",
+        ),
+        (
+            re.compile(r"\[stop_subagent\]"),
+            lambda m: "[SUBAGENT] Background search stopped",
+            "yellow",
+        ),
+        (
+            re.compile(r"Subagent identified via canary|Recorded spawn_subagent denial"),
+            lambda m: "[SECURITY] Anti-recursion guard active: directing agent to execute search directly",
+            "yellow",
+        ),
+        # Live Voice Bridge
+        (
+            re.compile(r"\[Silero VAD\] Speech onset detected!"),
+            lambda m: "[MIC] User speech detected on camera microphone",
+            "green",
+        ),
+        (
+            re.compile(r"\[Silero VAD\] Speech turn ended"),
+            lambda m: "[MIC] User finished speaking",
+            "green",
+        ),
+        (
+            re.compile(r"\[ChatGPT Audio Track\] Active speech received from ChatGPT.*streaming to speaker"),
+            lambda m: "[VOICE] ChatGPT response streaming to camera speaker...",
+            "green",
+        ),
+        (
+            re.compile(r"ChatGPT audio track finished or closed"),
+            lambda m: "[VOICE] ChatGPT speech turn completed",
+            "green",
+        ),
+        (
+            re.compile(r"\[VAD Wake-up\] Speech detected on camera mic"),
+            lambda m: "[WAKEUP] Speech detected on mic -> waking ChatGPT session",
+            "green",
+        ),
+        (
+            re.compile(r">>> ChatGPT Realtime DataChannel \(oai-events\) connected! Live voice active\. <<<"),
+            lambda m: "[LIVE BRIDGE] WebRTC connected! ChatGPT Live Voice ready",
+            "green",
+        ),
+        (
+            re.compile(r"\[LiveVoiceBridge\] Started ONVIF alert listener"),
+            lambda m: "[STANDBY] Camera ONVIF alert listener armed",
+            "green",
+        ),
+        # ONVIF Events
+        (
+            re.compile(r"\[Server ONVIF Event\] (.*)"),
+            lambda m: f"[ONVIF EVENT] {m.group(1)}",
+            "yellow",
+        ),
+    ]
+
+    COLORS = {
+        "cyan": "\033[96m",
+        "blue": "\033[94m",
+        "magenta": "\033[95m",
+        "yellow": "\033[93m",
+        "green": "\033[92m",
+        "reset": "\033[0m",
+        "dim": "\033[2m",
+    }
+
+    def __init__(self, log_files: list[Path]):
+        self.log_files = log_files
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def format_log_line(cls, line: str, colorize: bool = False) -> Optional[str]:
+        for pattern, formatter, color_name in cls.PATTERNS:
+            match = pattern.search(line)
+            if match:
+                try:
+                    text = formatter(match)
+                except Exception:
+                    continue
+                timestamp = time.strftime("%H:%M:%S")
+                if colorize and color_name in cls.COLORS:
+                    c = cls.COLORS[color_name]
+                    reset = cls.COLORS["reset"]
+                    dim = cls.COLORS["dim"]
+                    tag_end = text.find("]") + 1
+                    if tag_end > 1:
+                        tag = text[:tag_end]
+                        rest = text[tag_end:]
+                        return f"{dim}[{timestamp}]{reset} {c}{tag}{reset}{rest}"
+                    return f"{dim}[{timestamp}]{reset} {c}{text}{reset}"
+                return f"[{timestamp}] {text}"
+        return None
+
+    def _worker(self) -> None:
+        handles: dict[Path, Any] = {}
+        colorize = sys.stdout.isatty() and not os.getenv("NO_COLOR")
+
+        for p in self.log_files:
+            try:
+                if p.is_file():
+                    h = open(p, "r", encoding="utf-8", errors="replace")
+                    h.seek(0, os.SEEK_END)
+                    handles[p] = h
+            except Exception:
+                pass
+
+        while not self._stop_event.is_set():
+            had_data = False
+            for p in self.log_files:
+                if p not in handles:
+                    if p.is_file():
+                        try:
+                            h = open(p, "r", encoding="utf-8", errors="replace")
+                            handles[p] = h
+                        except Exception:
+                            continue
+                    else:
+                        continue
+
+                h = handles[p]
+                try:
+                    if p.stat().st_size < h.tell():
+                        h.seek(0, os.SEEK_SET)
+
+                    while not self._stop_event.is_set():
+                        line = h.readline()
+                        if not line:
+                            break
+                        had_data = True
+                        msg = self.format_log_line(line, colorize=colorize)
+                        if msg:
+                            sys.stdout.write(msg + "\n")
+                            sys.stdout.flush()
+                except Exception:
+                    pass
+
+            if not had_data:
+                time.sleep(0.15)
+
+        for h in handles.values():
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="ActionStreamer")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+
 def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description="CamXposed MCP Launcher with ChatGPT Live Voice Bridge")
@@ -593,11 +866,17 @@ def main() -> int:
                         help="ChatGPT voice name: cove, breeze, ember, juniper, vale (default: cove)")
     parser.add_argument("--motion-cooldown", type=float, default=float(os.getenv("CAMXPOSED_MOTION_COOLDOWN_S", "4.0")),
                         help="Cooldown in seconds after camera movement to suppress false-positive motion alarms (default: 4.0)")
+    default_verbose = os.getenv("CAMXPOSED_VERBOSE", "1").strip().lower() not in ("0", "false", "no", "off")
+    parser.add_argument("--verbose", dest="verbose", action=argparse.BooleanOptionalAction, default=default_verbose,
+                        help="Stream real-time camera actions and MCP tool calls to terminal (default: enabled)")
+    parser.add_argument("-q", "--quiet", dest="verbose", action="store_false",
+                        help="Disable real-time action streaming to terminal (quiet mode)")
     args, _ = parser.parse_known_args()
     os.environ["CAMXPOSED_MOTION_COOLDOWN_S"] = str(args.motion_cooldown)
 
     change_token = args.change_token
     mode = args.mode
+    is_verbose = bool(args.verbose)
 
     if sys.version_info < (3, 10):
         raise RuntimeError("CamXposed MCP requires Python 3.10 or newer.")
@@ -605,7 +884,8 @@ def main() -> int:
         raise RuntimeError("FFmpeg is missing. Install it first (Linux: apt install ffmpeg; Termux: pkg install ffmpeg).")
 
     platform_name = "Termux" if is_termux() else "Linux"
-    say(f"CamXposed MCP launcher — {platform_name} [Mode: {mode.upper()}]")
+    verbose_desc = "VERBOSE" if is_verbose else "QUIET"
+    say(f"CamXposed MCP launcher — {platform_name} [Mode: {mode.upper()}] [Terminal Output: {verbose_desc}]")
     lock_handle = acquire_instance_lock()
 
     # Convert SIGTERM into normal Python unwinding so finally always cleans
@@ -722,6 +1002,19 @@ def main() -> int:
 
         say("\nAll services started. Keep this process running. Press Ctrl+C to stop.")
 
+        streamer = None
+        if is_verbose:
+            say("✓ Verbose mode: streaming real-time camera actions and tool calls to terminal")
+            say("  Tip: Pass --quiet or --no-verbose to suppress live action logs.\n")
+            monitored_logs = []
+            if SERVER_LOG.is_file() or server_proc:
+                monitored_logs.append(SERVER_LOG)
+            if (LOG_DIR / "bridge.log").is_file() or bridge_proc:
+                monitored_logs.append(LOG_DIR / "bridge.log")
+            if monitored_logs:
+                streamer = LiveActionStreamer(monitored_logs)
+                streamer.start()
+
         while True:
             if server_proc and server_proc.poll() is not None:
                 raise RuntimeError(f"MCP server exited; inspect {SERVER_LOG}")
@@ -736,6 +1029,8 @@ def main() -> int:
         say("\nStopping all services...")
         return 0
     finally:
+        if streamer:
+            streamer.stop()
         stop_process(bridge_proc)
         stop_process(tunnel_proc)
         stop_process(server_proc)

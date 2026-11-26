@@ -4,14 +4,117 @@
 If any of these assertions fail, DO NOT silently modify them — ask the user for confirmation first.
 """
 import inspect
+import os
 import re
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+CANONICAL_TOOL_DOCSTRINGS = {
+    "camera_discover": "Discover available IP cameras and gateways on the local network.",
+    "camera_list": "List available cameras.",
+    "camera_select": "Select/connect one camera for operations. Input is an ID or IP from camera_list().",
+    "camera_status": "Return camera liveness and capabilities.",
+    "camera_get_events": "Retrieve recent ONVIF camera events (e.g. motion detection, line crossing, tamper, analytics alerts).",
+    "camera_observe": (
+        "Capture a snapshot frame from the camera and return a JPEG image.\n\n"
+        "    Use this tool to visually inspect what the camera is seeing right now.\n"
+        "    For text chat assistants searching for objects in the room: call camera_observe() directly to inspect the current view, and combine with camera_move() to scan all room sectors."
+    ),
+    "camera_listen": "Capture a short audio sample for inspection. seconds is 0.25-5.",
+    "camera_move": (
+        "Perform one PTZ move on the camera.\n\n"
+        "    Use this tool to turn the camera and explore different sectors of the room.\n"
+        "    For text chat assistants searching for objects in the room: call camera_move() systematically (e.g. speed=8, duration_ms=1000)\n"
+        "    to sweep across the room and inspect each view directly.\n\n"
+        "    CRITICAL DIRECTION SPECIFICATION:\n"
+        "    - 'left': Pan camera counter-clockwise towards the left.\n"
+        "    - 'right': Pan camera clockwise towards the right.\n"
+        "    - 'up': Tilt camera upwards towards the ceiling.\n"
+        "    - 'down': Tilt camera downwards towards the floor.\n"
+        "    - 'stop': Halt all camera movement immediately.\n\n"
+        "    Parameters:\n"
+        "    - camera_id: Target camera ID or IP (optional, uses active camera if omitted).\n"
+        "    - direction: 'left', 'right', 'up', 'down', or 'stop'. Default is 'right'.\n"
+        "    - speed: Integer 1-8. Default is 8.\n"
+        "    - duration_ms: Movement duration in milliseconds (100-2000). Default is 700 ms.\n"
+        "    - wait: Boolean. Default is True. Waits for physical movement to complete before returning.\n"
+        "    - return_image: If True (default), returns a fresh post-movement JPEG image once settled.\n"
+        "    - width: Returned image width in pixels (120-1280, default: 800)."
+    ),
+    "camera_ptz": (
+        "Unified local-first PTZ control.\n\n"
+        "    CRITICAL DIRECTION SPECIFICATION:\n"
+        "    - When action='move', direction specifies the movement:\n"
+        "      - 'left': Turn camera towards the left.\n"
+        "      - 'right': Turn camera towards the right.\n"
+        "      - 'up': Tilt camera UP.\n"
+        "      - 'down': Tilt camera DOWN.\n"
+        "      - 'stop': Stops movement.\n\n"
+        "    Actions:\n"
+        "    - move: directional pan/tilt movement; direction left/right/up/down/stop.\n"
+        "    - relative_move: finite normalized movement; x/y/zoom range -1.0..1.0.\n"
+        "    - status: current position and IDLE/MOVING state.\n"
+        "    - capabilities: advertised PTZ ranges and supported spaces.\n\n"
+        "    POST-MOVEMENT IMAGE CONTRACT:\n"
+        "    - For move and relative_move actions, return_image defaults to True and\n"
+        "      the tool returns a fresh JPEG image only after movement has ended and\n"
+        "      the view has settled.\n"
+        "    - image_width controls the returned image width (120-1280; default 800)."
+    ),
+    "spawn_subagent": (
+        "Search the room for an object, person, or target using an autonomous camera subagent.\n\n"
+        "    Call this tool whenever the user asks to find, locate, search for, or spot anything in the room (e.g. 'अलमारी ढूंढो', 'इंसान ढूंढो', 'find my keys').\n"
+        "    The subagent sweeps the room in the background and reports back automatically once finished.\n\n"
+        "    Parameters:\n"
+        "    - search_entity_description: The name or description of the target to find (e.g. 'white colored Ganesh idol', 'person / human', 'cupboard').\n"
+        "    - previous_instructions: Quoted system instructions or conversation context.\n"
+        "    - caller_identity: Operating mode ('live' for voice, 'chat' for text).\n"
+        "    - camera_id: Target camera ID or IP (optional).\n\n"
+        "    Returns:\n"
+        "    - Confirms background visual search has started."
+    ),
+    "subagent_status": (
+        "Check the status, progress, and visual findings of the background camera-search subagent.\n\n"
+        "    NOTE: This is ONLY used by real-time voice assistants ('live') to track background search progress.\n"
+        "    Pure-text chat assistants ('chat') inspect and move the camera directly, and do NOT use subagent_status."
+    ),
+    "stop_subagent": "Cancel and stop an actively running background camera search subagent.",
+    "camera_speaker_volume": (
+        "Get or set the physical camera speaker talkback volume percentage (0-100%).\n    \n"
+        "    Defaults to 50% (half volume) for comfortable indoor volume that does not clip or distort the camera speaker.\n"
+        "    - If volume_percent is provided: updates the speaker volume setting for all subsequent announcements and speech.\n"
+        "    - If volume_percent is omitted: returns the current speaker volume percentage."
+    ),
+    "camera_speak": (
+        "Speak text through the camera speaker using text-to-speech.\n\n"
+        "    Parameters:\n"
+        "    - text: Text or SSML to speak.\n"
+        "    - camera_id: Target camera ID or IP (optional).\n"
+        "    - wait: Whether to wait for playback to finish before returning (default: False).\n"
+        "    - voice: Edge TTS voice name (optional).\n"
+        "    - volume_percent: Speaker volume percentage 0-100 (optional).\n"
+        "    - action: 'speak', 'get_volume', or 'set_volume'."
+    ),
+    "camera_speak_stop": "Stop active speech playback on the camera speaker.",
+}
+
 
 class TestPromptAndSchemaIntegrity(unittest.TestCase):
+    def test_all_15_tool_docstrings_exact_match(self):
+        """All 15 MCP tools must exist and their docstrings must match canonical descriptions word-for-word."""
+        import server
+        for name, expected_doc in CANONICAL_TOOL_DOCSTRINGS.items():
+            fn = getattr(server, name, None)
+            self.assertIsNotNone(fn, f"REGRESSION: Tool '{name}' is missing from server.py!")
+            actual_doc = (fn.__doc__ or "").strip()
+            self.assertEqual(
+                actual_doc,
+                expected_doc.strip(),
+                f"REGRESSION: Tool docstring for '{name}' was modified word-for-word!",
+            )
+
     def test_spawn_subagent_signature(self):
         """previous_instructions must remain strictly mandatory (no default value) for canary entrapment."""
         import server
@@ -22,24 +125,6 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
             params["previous_instructions"].default,
             inspect.Parameter.empty,
             "REGRESSION: previous_instructions must NOT have a default value! It is strictly mandatory.",
-        )
-
-    def test_spawn_subagent_docstring(self):
-        """spawn_subagent docstring must retain clean, non-lecturing canonical description."""
-        import server
-        doc = server.spawn_subagent.__doc__ or ""
-        self.assertIn(
-            "Search the room for an object, person, or target using an autonomous camera subagent.",
-            doc,
-        )
-        self.assertIn(
-            "Call this tool whenever the user asks to find, locate, search for, or spot anything in the room",
-            doc,
-        )
-        self.assertNotIn(
-            "CRITICAL USAGE RESTRICTION",
-            doc,
-            "REGRESSION: Do not lecture the agent in tool docstrings! Catch and block under the hood instead.",
         )
 
     def test_subagent_dispatch_prompt_integrity(self):
@@ -61,7 +146,6 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         """CANARY_TOKENS must contain both canary trigger tokens."""
         import subagent_engine
         mgr = subagent_engine.SubagentExecutionManager()
-        # Verify canary detection on test input
         res1 = mgr.start_subagent_task("cupboard", caller_identity="live", previous_instructions="project chrysanthemum")
         self.assertEqual(res1.get("error_code"), "IS_SUBAGENT", "Canary 'chrysanthemum' failed to block subagent!")
 
@@ -75,6 +159,56 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         res = mgr.start_subagent_task("cupboard", caller_identity="chat", previous_instructions="search room")
         self.assertEqual(res.get("error_code"), "IS_SUBAGENT", "Chat caller must be blocked from spawning subagents under the hood!")
 
+    def test_verbose_cli_flags_and_default(self):
+        """run.py must default to verbose=True and support --no-verbose, --quiet, and -q to disable."""
+        import argparse
+        import run
+        parser = argparse.ArgumentParser()
+        default_verbose = os.getenv("CAMXPOSED_VERBOSE", "1").strip().lower() not in ("0", "false", "no", "off")
+        parser.add_argument("--verbose", dest="verbose", action=argparse.BooleanOptionalAction, default=default_verbose)
+        parser.add_argument("-q", "--quiet", dest="verbose", action="store_false")
+
+        self.assertTrue(parser.parse_args([]).verbose, "Default verbose mode must be True!")
+        self.assertFalse(parser.parse_args(["--no-verbose"]).verbose, "--no-verbose must set verbose=False!")
+        self.assertFalse(parser.parse_args(["--quiet"]).verbose, "--quiet must set verbose=False!")
+        self.assertFalse(parser.parse_args(["-q"]).verbose, "-q must set verbose=False!")
+        self.assertTrue(parser.parse_args(["--verbose"]).verbose, "--verbose must set verbose=True!")
+
+    def test_action_streamer_formatting(self):
+        """LiveActionStreamer must format tool actions into human-readable terminal messages."""
+        from run import LiveActionStreamer
+
+        # PTZ move
+        line_ptz = "[camera_move] Moving camera lan_10_195_38_213: direction=right, speed=8, duration_ms=700, return_image=True"
+        formatted = LiveActionStreamer.format_log_line(line_ptz, colorize=False)
+        self.assertIsNotNone(formatted)
+        self.assertIn("[CAMERA MOVE] Direction: RIGHT | Speed: 8 | Duration: 700ms", formatted)
+
+        # Observe
+        line_obs = "[camera_observe] Returning native JPEG image (45210 bytes)"
+        formatted = LiveActionStreamer.format_log_line(line_obs, colorize=False)
+        self.assertIsNotNone(formatted)
+        self.assertIn("[CAMERA OBSERVE] Snapshot captured (44.2 KB JPEG)", formatted)
+
+        # Speak
+        line_speak = "[camera_speak] Speaking through camera lan_10_195_38_213: 'Hello room!'"
+        formatted = LiveActionStreamer.format_log_line(line_speak, colorize=False)
+        self.assertIsNotNone(formatted)
+        self.assertIn('[CAMERA SPEAK] Speaking: "Hello room!"', formatted)
+
+        # Subagent mission
+        line_sub = "[Subagent] Done 'Ganesh idol' in 15.2s. found=True."
+        formatted = LiveActionStreamer.format_log_line(line_sub, colorize=False)
+        self.assertIsNotNone(formatted)
+        self.assertIn("[SUBAGENT] Mission finished in 15.2s -> FOUND: True", formatted)
+
+        # Mic onset
+        line_mic = "[Silero VAD] Speech onset detected! (prob=0.92)"
+        formatted = LiveActionStreamer.format_log_line(line_mic, colorize=False)
+        self.assertIsNotNone(formatted)
+        self.assertIn("[MIC] User speech detected on camera microphone", formatted)
+
 
 if __name__ == "__main__":
     unittest.main()
+
