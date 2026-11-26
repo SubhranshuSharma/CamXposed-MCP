@@ -96,21 +96,48 @@ This branch adds full-duplex realtime voice communication and autonomous backgro
    - Supports `--mode mcp` (MCP server only).
    - Supports `--mode live` (Live Voice Bridge only).
 
-### Running the System
+### Quick Start (Linux & Android Termux)
 
+#### Option 1: One-Command Self-Install & Run (Fresh Machine or Termux)
+Run this single command in a terminal (works on Android Termux, Ubuntu, Debian, Fedora, Arch):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SubhranshuSharma/CamXposed-MCP/feature/live-voice-bridge-and-visual-subagent/start.sh | bash
+```
+
+To pass custom flags directly to the one-command runner (e.g. `--mode live` or `--mode mcp`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/SubhranshuSharma/CamXposed-MCP/feature/live-voice-bridge-and-visual-subagent/start.sh | bash -s -- --mode live
+```
+
+#### Option 2: Running Inside the Cloned Repository
+If you already cloned this branch, simply run the self-installing launcher:
+
+```bash
+./start.sh
+```
+
+Or pass any runtime mode:
+```bash
+./start.sh --mode live
+./start.sh --mode mcp
+./start.sh --mode both
+```
+
+#### Option 3: Manual Execution
 Start both the MCP server and Live Voice Bridge:
 ```bash
-python3 run.py --mode both
+python3 run.py --mode both   # On Termux: python run.py --mode both
 ```
 
 Start only the MCP server (exposed via ngrok for ChatGPT Developer mode / MCP client):
 ```bash
-python3 run.py --mode mcp
+python3 run.py --mode mcp    # On Termux: python run.py --mode mcp
 ```
 
 Start only the Live Voice Bridge:
 ```bash
-python3 run.py --mode live
+python3 run.py --mode live   # On Termux: python run.py --mode live
 ```
 
 Or run the lightweight standalone MCP launcher:

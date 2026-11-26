@@ -3,6 +3,7 @@
 set -eu
 
 INSTALL_DIR="${CAMXPOSED_INSTALL_DIR:-$HOME/camxposed-mcp}"
+TARGET_BRANCH="${CAMXPOSED_BRANCH:-feature/live-voice-bridge-and-visual-subagent}"
 
 say() { printf '%s\n' "$*"; }
 fail() { say "Error: $*" >&2; exit 1; }
@@ -19,7 +20,8 @@ if [ "$is_termux" -eq 1 ]; then
   command -v pkg >/dev/null 2>&1 || fail "Termux package manager (pkg) was not found."
   say "Installing Termux prerequisites..."
   pkg update
-  pkg install -y git python nodejs ffmpeg
+  pkg install -y git python nodejs ffmpeg clang make libjpeg-turbo
+  pkg install -y python-numpy 2>/dev/null || true
 elif command -v apt-get >/dev/null 2>&1; then
   say "Installing Debian/Ubuntu prerequisites..."
   if [ "$(id -u)" -eq 0 ]; then SUDO=""; else
@@ -54,16 +56,16 @@ if [ -e "$INSTALL_DIR" ]; then
     *) fail "$INSTALL_DIR is a Git repository, but its origin is not CamXposed-MCP: $origin" ;;
   esac
   [ -z "$(git -C "$INSTALL_DIR" status --porcelain)" ] || fail "$INSTALL_DIR has local changes. Commit/stash them or choose another CAMXPOSED_INSTALL_DIR."
-  say "Updating existing CamXposed MCP checkout..."
-  branch="$(git -C "$INSTALL_DIR" branch --show-current)"
-  if [ "$branch" != "main" ]; then
-    git -C "$INSTALL_DIR" checkout main
+  say "Updating existing CamXposed MCP checkout ($TARGET_BRANCH)..."
+  branch="$(git -C "$INSTALL_DIR" branch --show-current 2>/dev/null || true)"
+  if [ "$branch" != "$TARGET_BRANCH" ]; then
+    git -C "$INSTALL_DIR" checkout "$TARGET_BRANCH" 2>/dev/null || git -C "$INSTALL_DIR" checkout -b "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
   fi
-  git -C "$INSTALL_DIR" pull --ff-only origin main
+  git -C "$INSTALL_DIR" pull --ff-only origin "$TARGET_BRANCH"
 else
-  say "Cloning CamXposed MCP into $INSTALL_DIR ..."
+  say "Cloning CamXposed MCP ($TARGET_BRANCH) into $INSTALL_DIR ..."
   mkdir -p "$(dirname "$INSTALL_DIR")"
-  git clone --depth 1 https://github.com/SubhranshuSharma/CamXposed-MCP.git "$INSTALL_DIR"
+  git clone --depth 1 -b "$TARGET_BRANCH" https://github.com/SubhranshuSharma/CamXposed-MCP.git "$INSTALL_DIR"
 fi
 
 say ""
@@ -76,3 +78,21 @@ else
 fi
 say ""
 say "The first launch will ask for your ngrok token once and save it securely."
+
+AUTO_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --run|-r) AUTO_RUN=1 ;;
+  esac
+done
+
+if [ "$AUTO_RUN" -eq 1 ] || [ "${CAMXPOSED_AUTO_RUN:-0}" = "1" ]; then
+  say ""
+  say "Auto-launching CamXposed MCP..."
+  cd "$INSTALL_DIR"
+  if [ "$is_termux" -eq 1 ]; then
+    exec python run.py
+  else
+    exec python3 run.py
+  fi
+fi

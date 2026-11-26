@@ -461,8 +461,44 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
             self.assertTrue(busy)
             self.assertEqual(reason, "subagent_searching")
 
+    def test_self_install_and_runners(self):
+        """Self-installing runner (start.sh), install.sh, and run.py must support Termux and Linux with full live bridge deps."""
+        import run
+        from pathlib import Path
+        root = Path(run.ROOT)
+
+        # 1. run.py dependencies
+        self.assertIn("aiortc", run.REQUIRED_LIVE)
+        self.assertIn("av", run.REQUIRED_LIVE)
+        self.assertIn("numpy", run.REQUIRED_LIVE)
+        self.assertIn("aioice", run.REQUIRED_LIVE)
+        self.assertIn("onnxruntime", run.REQUIRED_LIVE)
+
+        # 2. requirements.txt
+        reqs = (root / "requirements.txt").read_text(encoding="utf-8")
+        for pkg in ["aiortc", "av", "numpy", "aioice", "onnxruntime"]:
+            self.assertIn(pkg, reqs)
+
+        # 3. start.sh exists, is executable, and handles Termux + Linux
+        start_sh = root / "start.sh"
+        self.assertTrue(start_sh.is_file())
+        self.assertTrue(os.access(start_sh, os.X_OK))
+        start_content = start_sh.read_text(encoding="utf-8")
+        self.assertTrue(start_content.startswith("#!/bin/sh"))
+        self.assertIn("is_termux", start_content)
+        self.assertIn("run.py", start_content)
+
+        # 4. install.sh branch and auto-run
+        install_sh = root / "install.sh"
+        self.assertTrue(install_sh.is_file())
+        install_content = install_sh.read_text(encoding="utf-8")
+        self.assertIn("TARGET_BRANCH", install_content)
+        self.assertIn("python-numpy", install_content)
+        self.assertIn("--run", install_content)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

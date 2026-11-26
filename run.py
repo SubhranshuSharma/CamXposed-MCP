@@ -37,6 +37,13 @@ REQUIRED = {
     "wsdiscovery": "wsdiscovery",
     "zeroconf": "zeroconf",
 }
+REQUIRED_LIVE = {
+    "aiortc": "aiortc",
+    "av": "av",
+    "numpy": "numpy",
+    "aioice": "aioice",
+    "onnxruntime": "onnxruntime",
+}
 
 
 def is_termux() -> bool:
@@ -52,8 +59,11 @@ def run_checked(cmd: list[str], *, env=None) -> None:
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
-def ensure_python_dependencies() -> None:
-    missing = [package for module, package in REQUIRED.items()
+def ensure_python_dependencies(mode: str = "both") -> None:
+    required = dict(REQUIRED)
+    if mode in ("live", "both"):
+        required.update(REQUIRED_LIVE)
+    missing = [package for module, package in required.items()
                if importlib.util.find_spec(module) is None]
     if not missing:
         say("✓ Python dependencies are ready")
@@ -920,7 +930,7 @@ def main() -> int:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, handle_sigterm)
-    ensure_python_dependencies()
+    ensure_python_dependencies(mode)
     verify_prompt_and_schema_integrity()
 
     target_camera_ip = args.camera_ip
