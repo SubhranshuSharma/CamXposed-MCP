@@ -168,7 +168,7 @@ def _announce_on_camera_speaker(camera_id: Optional[str], text: str):
             import tempfile, subprocess, os, re, edge_tts
             from lan_engine import AnykaLanSpeaker, lan_engine
 
-            cam_ip = "10.195.38.213"
+            cam_ip = os.getenv("CAMXPOSED_CAMERA_IP", "").strip()
             if camera_id:
                 raw = str(camera_id).strip()
                 if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", raw):
@@ -177,6 +177,10 @@ def _announce_on_camera_speaker(camera_id: Optional[str], text: str):
                     cand_ip = raw.removeprefix("lan_").replace("_", ".")
                     if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", cand_ip):
                         cam_ip = cand_ip
+            if not cam_ip:
+                with lan_engine.lock:
+                    if lan_engine.discovered_cameras:
+                        cam_ip = next(iter(lan_engine.discovered_cameras.values())).ip
 
             has_devanagari = bool(re.search(r"[\u0900-\u097F]", text))
             voice = "hi-IN-MadhurNeural" if has_devanagari else "en-IN-PrabhatNeural"

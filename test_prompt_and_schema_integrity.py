@@ -499,9 +499,19 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
     def test_gemini_live_bridge_and_subagent_integrity(self):
         """Gemini Live Bridge and Vision Subagent must have official tool declarations, pure chat routing, and barge-in."""
         import gemini
+        from lan_engine import LanCamera, lan_engine
+
+        mock_cam = LanCamera(
+            id="lan_test",
+            ip="127.0.0.1",
+            stream_uri="rtsp://127.0.0.1:554/ch0_0.264",
+            snapshot_url="http://127.0.0.1:8888/snapshot"
+        )
+        with lan_engine.lock:
+            lan_engine.discovered_cameras["127.0.0.1"] = mock_cam
 
         bridge = gemini.GeminiLiveBridge(
-            camera_ip="10.195.38.213",
+            camera_ip="127.0.0.1",
             api_key="test-api-key"
         )
         tools = bridge._setup_tool_declarations()
@@ -516,12 +526,12 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertIn("camera_speak", names)
 
         # 2. Subagent does NOT have spawn_subagent in its tools/routing (eliminating recursion natively)
-        subagent = gemini.GeminiSubagent(client=bridge.client, camera_ip="10.195.38.213")
+        subagent = gemini.GeminiSubagent(client=bridge.client, camera_ip="127.0.0.1")
         self.assertFalse(subagent.is_busy())
         self.assertEqual(subagent.get_target(), "")
 
         # 3. Speaker instant barge-in cut-off
-        speaker = gemini.GeminiCameraSpeaker(camera_ip="10.195.38.213")
+        speaker = gemini.GeminiCameraSpeaker(camera_ip="127.0.0.1")
         speaker.is_playing = True
         speaker.queue.extend(b"\x00" * 1000)
         speaker.stop_playback(reason="test_barge_in")

@@ -553,9 +553,19 @@ def select_camera_via_ws_discovery() -> str:
     cams = [c for c in res.get("cameras", []) if isinstance(c, dict) and c.get("ip")]
 
     if not cams:
-        fallback_ip = os.getenv("CAMXPOSED_CAMERA_IP", "10.195.38.213")
-        say(f"! No verified ONVIF cameras found via WS-Discovery. Falling back to: {fallback_ip}")
-        return fallback_ip
+        fallback_ip = os.getenv("CAMXPOSED_CAMERA_IP", "").strip()
+        if fallback_ip:
+            say(f"! No verified ONVIF cameras found via WS-Discovery. Using CAMXPOSED_CAMERA_IP: {fallback_ip}")
+            return fallback_ip
+        say("! No verified ONVIF cameras found via WS-Discovery (UDP 3702).")
+        if sys.stdin.isatty():
+            try:
+                entered = input("Enter camera IP address manually: ").strip()
+                if entered:
+                    return entered
+            except (EOFError, KeyboardInterrupt):
+                pass
+        raise RuntimeError("No ONVIF cameras discovered via WS-Discovery (UDP 3702) and no CAMXPOSED_CAMERA_IP provided.")
 
     say(f"Found {len(cams)} verified ONVIF camera(s):")
     for idx, cam in enumerate(cams, 1):

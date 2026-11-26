@@ -36,11 +36,83 @@ except ImportError:
 from lan_engine import lan_engine, LanCamera
 from live_voice_bridge import SileroVAD
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] camxposed.gemini: %(message)s"
-)
+class PrettyColoredFormatter(logging.Formatter):
+    """Rich ANSI color formatting with badges and clean timestamps for beautiful CLI output."""
+
+    # ANSI Codes
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+
+    # Colors
+    GRAY = "\033[90m"
+    CYAN = "\033[36m"
+    BRIGHT_CYAN = "\033[1;36m"
+    GREEN = "\033[32m"
+    BRIGHT_GREEN = "\033[1;32m"
+    YELLOW = "\033[33m"
+    BRIGHT_YELLOW = "\033[1;33m"
+    RED = "\033[31m"
+    BRIGHT_RED = "\033[1;31m"
+    MAGENTA = "\033[35m"
+    BRIGHT_MAGENTA = "\033[1;35m"
+    BLUE = "\033[34m"
+    BRIGHT_BLUE = "\033[1;34m"
+    ORANGE = "\033[38;5;208m"
+
+    LEVEL_BADGES = {
+        logging.DEBUG: f"\033[90mDEBUG\033[0m",
+        logging.INFO: f"\033[1;36mINFO\033[0m ",
+        logging.WARNING: f"\033[1;33mWARN\033[0m ",
+        logging.ERROR: f"\033[1;31mFAIL\033[0m",
+        logging.CRITICAL: f"\033[1;41mCRIT\033[0m",
+    }
+
+    TAG_STYLES = [
+        ("[Subagent]", f"\033[1;35m🤖 [Subagent]\033[0m"),
+        ("[Tool Call]", f"\033[1;32m⚙️  [Tool Call]\033[0m"),
+        ("[Gemini Live]", f"\033[1;34m⚡ [Gemini Live]\033[0m"),
+        ("[Server Event]", f"\033[1;36m📡 [Server Event]\033[0m"),
+        ("[WS-Discovery]", f"\033[38;5;208m📡 [WS-Discovery]\033[0m"),
+        ("[PTZ]", f"\033[1;33m🔄 [PTZ]\033[0m"),
+        ("[Mic]", f"\033[36m🎙️  [Mic]\033[0m"),
+        ("[Speaker]", f"\033[32m🔊 [Speaker]\033[0m"),
+        ("✓", f"\033[1;32m✓\033[0m"),
+    ]
+
+    def __init__(self, use_color: Optional[bool] = None):
+        super().__init__()
+        if use_color is None:
+            self.use_color = sys.stdout.isatty() or os.getenv("FORCE_COLOR") == "1"
+        else:
+            self.use_color = use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        timestamp = time.strftime("%H:%M:%S", time.localtime(record.created))
+        ms = int(record.msecs)
+        message = record.getMessage()
+
+        if not self.use_color:
+            return f"{timestamp}.{ms:03d} [{record.levelname}] camxposed.gemini: {message}"
+
+        time_str = f"{self.GRAY}{timestamp}.{ms:03d}{self.RESET}"
+        level_str = self.LEVEL_BADGES.get(record.levelno, record.levelname)
+        mod_badge = f"{self.BOLD}{self.CYAN}gemini{self.RESET}"
+
+        for tag, styled in self.TAG_STYLES:
+            if tag in message:
+                message = message.replace(tag, styled)
+
+        return f"{time_str} {level_str} {mod_badge} ❯ {message}"
+
+
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(PrettyColoredFormatter())
 logger = logging.getLogger("camxposed.gemini")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(_handler)
+logger.propagate = False
 
 CONFIG_DIR = Path(os.path.expanduser("~/.config/camxposed-mcp"))
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -138,8 +210,92 @@ def get_gemini_api_key() -> str:
     )
 
 
-def resolve_camera(camera_ip: str) -> LanCamera:
-    """Finds or constructs a LanCamera instance for the given camera IP."""
+def select_camera_via_ws_discovery(interactive: bool = True) -> str:
+    """Discovers ONVIF cameras via WS-Discovery on LAN and returns verified camera IP."""
+    logger.info("Scanning LAN for verified ONVIF cameras via WS-Discovery (UDP 3702)...")
+    res = lan_engine.discover_all(timeout=2.0)
+    cams = [c for c in res.get("cameras", []) if isinstance(c, dict) and c.get("ip")]
+
+    if not cams:
+        env_ip = os.getenv("CAMXPOSED_CAMERA_IP", "").strip()
+        if env_ip:
+            logger.info(f"WS-Discovery found 0 cameras; using CAMXPOSED_CAMERA_IP: {env_ip}")
+            return env_ip
+        with lan_engine.lock:
+            if lan_engine.discovered_cameras:
+                first = next(iter(lan_engine.discovered_cameras.values()))
+                return first.ip
+        if interactive and sys.stdin.isatty():
+            try:
+                entered = input("No ONVIF cameras found via WS-Discovery. Enter camera IP: ").strip()
+                if entered:
+                    return entered
+            except (EOFError, KeyboardInterrupt):
+                pass
+        raise RuntimeError("No ONVIF cameras discovered via WS-Discovery (UDP 3702) and no CAMXPOSED_CAMERA_IP specified.")
+
+    logger.info(f"Found {len(cams)} verified ONVIF camera(s) via WS-Discovery:")
+    for idx, c in enumerate(cams, 1):
+        ptz = " [PTZ Supported]" if c.get("ptzSupported") else ""
+        logger.info(f"  [{idx}] {c.get('name', 'Camera')} - IP: {c.get('ip')}{ptz}")
+
+    default_cam = cams[0]
+    default_ip = default_cam["ip"]
+
+    if len(cams) == 1 or not (interactive and sys.stdin.isatty()):
+        logger.info(f"Target Camera auto-selected: {default_ip}")
+        os.environ["CAMXPOSED_CAMERA_IP"] = default_ip
+        return default_ip
+
+    try:
+        prompt = f"\nSelect camera [1-{len(cams)}] (press Enter or wait 5s for default: 1 [ {default_ip} ]): "
+        user_choice = None
+
+        def _get_input():
+            nonlocal user_choice
+            try:
+                user_choice = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                user_choice = ""
+
+        t = threading.Thread(target=_get_input, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+
+        if not user_choice:
+            chosen_ip = default_ip
+        elif user_choice.isdigit() and 1 <= int(user_choice) <= len(cams):
+            chosen_ip = cams[int(user_choice) - 1]["ip"]
+        elif re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", user_choice):
+            chosen_ip = user_choice
+        else:
+            chosen_ip = default_ip
+    except (EOFError, KeyboardInterrupt):
+        chosen_ip = default_ip
+
+    logger.info(f"Target Camera selected: {chosen_ip}")
+    os.environ["CAMXPOSED_CAMERA_IP"] = chosen_ip
+    return chosen_ip
+
+
+def resolve_camera(camera_ip: Optional[str] = None) -> LanCamera:
+    """Finds or discovers a LanCamera instance via WS-Discovery or given IP."""
+    if not camera_ip:
+        camera_ip = os.getenv("CAMXPOSED_CAMERA_IP", "").strip()
+
+    with lan_engine.lock:
+        if camera_ip:
+            if camera_ip in lan_engine.discovered_cameras:
+                return lan_engine.discovered_cameras[camera_ip]
+            for c in lan_engine.discovered_cameras.values():
+                if c.ip == camera_ip or c.id == camera_ip:
+                    return c
+        elif lan_engine.discovered_cameras:
+            return next(iter(lan_engine.discovered_cameras.values()))
+
+    if not camera_ip:
+        camera_ip = select_camera_via_ws_discovery(interactive=False)
+
     with lan_engine.lock:
         if camera_ip in lan_engine.discovered_cameras:
             return lan_engine.discovered_cameras[camera_ip]
@@ -864,17 +1020,21 @@ class GeminiLiveBridge:
 
 def main():
     parser = argparse.ArgumentParser(description="CamXposed Gemini Live Voice Bridge")
-    parser.add_argument("--camera-ip", default=os.getenv("CAMXPOSED_CAMERA_IP", "10.195.38.213"),
-                        help="Target camera IP address")
+    parser.add_argument("--camera-ip", default=os.getenv("CAMXPOSED_CAMERA_IP", None),
+                        help="Target camera IP address (auto-discovered via WS-Discovery if omitted)")
     parser.add_argument("--api-key", default=None, help="Gemini API Key")
     parser.add_argument("--live-model", default=GEMINI_LIVE_MODEL, help="Gemini Live model name")
     parser.add_argument("--chat-model", default=GEMINI_CHAT_MODEL, help="Gemini Chat model name for subagent")
     parser.add_argument("--voice", default=GEMINI_VOICE, help="Gemini voice name (e.g. Puck, Charon, Aoede)")
     args = parser.parse_args()
 
+    camera_ip = args.camera_ip
+    if not camera_ip:
+        camera_ip = select_camera_via_ws_discovery(interactive=True)
+
     api_key = args.api_key or get_gemini_api_key()
     bridge = GeminiLiveBridge(
-        camera_ip=args.camera_ip,
+        camera_ip=camera_ip,
         api_key=api_key,
         live_model=args.live_model,
         voice_name=args.voice

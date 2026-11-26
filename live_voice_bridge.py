@@ -1899,7 +1899,20 @@ class LiveVoiceBridge:
         await self.stop_session()
 
 
-def run_live_bridge(camera_ip: str, voice: str = "cove", token: Optional[str] = None, account_email: Optional[str] = None):
+def run_live_bridge(camera_ip: Optional[str] = None, voice: str = "cove", token: Optional[str] = None, account_email: Optional[str] = None):
+    if not camera_ip:
+        camera_ip = os.getenv("CAMXPOSED_CAMERA_IP", "").strip()
+    if not camera_ip:
+        from lan_engine import lan_engine
+        res = lan_engine.discover_all(timeout=2.0)
+        cams = [c for c in res.get("cameras", []) if isinstance(c, dict) and c.get("ip")]
+        if cams:
+            camera_ip = cams[0]["ip"]
+        elif lan_engine.discovered_cameras:
+            camera_ip = next(iter(lan_engine.discovered_cameras.values())).ip
+        else:
+            raise RuntimeError("No camera IP provided and no ONVIF camera discovered via WS-Discovery.")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     bridge = LiveVoiceBridge(camera_ip=camera_ip, voice=voice, token=token, account_email=account_email)
@@ -1915,7 +1928,8 @@ def run_live_bridge(camera_ip: str, voice: str = "cove", token: Optional[str] = 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="CamXposed <-> ChatGPT Web Voice Bridge")
-    parser.add_argument("--camera-ip", default="10.195.38.213", help="Camera local IP address")
+    parser.add_argument("--camera-ip", default=os.getenv("CAMXPOSED_CAMERA_IP", None),
+                        help="Camera local IP address (auto-discovered via WS-Discovery if omitted)")
     parser.add_argument("--voice", default="cove", help="ChatGPT voice name (e.g. cove, breeze, ember, juniper, vale)")
     parser.add_argument("--token", default=None, help="Optional ChatGPT session/access token")
     parser.add_argument("--account-email", default=None, help="Optional ChatGPT account email")
