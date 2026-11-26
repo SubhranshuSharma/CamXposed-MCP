@@ -79,22 +79,20 @@ RULES:
 
 This branch adds full-duplex realtime voice communication and autonomous background visual search:
 
-1. **Full-Duplex Live Voice Bridge (`live_voice_bridge.py`)**:
-   - Bridges the camera's RTSP microphone directly to ChatGPT Realtime Voice via WebRTC.
-   - Streams ChatGPT's synthesized voice responses back to the physical camera speaker (Anyka talkback port 8000 / raw PCM/A-law).
-   - Features local client-side Silero VAD (Voice Activity Detection) with instant audio cutoff upon user barge-in.
-   - Supports auto-discovery of ChatGPT session tokens from local browser profiles (Firefox containers) or direct token/cookie injection.
+1. **Google Gemini Live Voice Bridge & Vision Subagent (`gemini.py`)**:
+   - **Gemini Live API (`gemini-3.8-live`)**: Full-duplex bidirectional streaming voice over WebSockets with official function calling.
+   - **Pure Chat Vision Subagent (`gemini-2.5-flash`)**: Autonomous visual room sweeping using native multimodal vision on physical camera snapshots.
+   - **Official Tool Routing**: `spawn_subagent` is officially declared for the front-line voice agent and never exposed to the subagent, eliminating recursion naturally without canary tokens or entrapment hacks.
+   - **Non-Blocking Background Concurrency**: The live conversational session remains fully active while the subagent sweeps the room. The user can chat freely while the camera moves, and the final outcome is announced conversationally upon completion.
+   - **Instant Barge-In**: Silero VAD + Gemini server interruption cut off camera speaker output immediately when the user speaks.
 
-2. **Autonomous Visual Subagent (`subagent_engine.py`)**:
-   - Dispatches a background visual search subagent via `spawn_subagent(search_entity_description="...")`.
-   - Autonomously sweeps the room using ONVIF PTZ, capturing camera snapshots at each waypoint.
-   - Evaluates frames via ChatGPT SSE HTTP stream, detecting entities with canary protection and spatial confirmation.
-   - Automatically stops the camera upon target acquisition and injects a synthesized completion message directly into the live voice session.
+2. **ChatGPT Live Voice Bridge & Visual Subagent (`live_voice_bridge.py`, `subagent_engine.py`)**:
+   - Bridges the camera's RTSP microphone to ChatGPT Realtime Voice via WebRTC gateway with Firefox token auto-refresh.
+   - Autonomous visual subagent sweeps the room via ONVIF PTZ with canary protection and spatial confirmation.
 
-3. **Unified Multi-Mode Launcher (`run.py`)**:
-   - Supports `--mode both` (default: MCP server + Live Voice Bridge + Go gateway).
-   - Supports `--mode mcp` (MCP server only).
-   - Supports `--mode live` (Live Voice Bridge only).
+3. **Unified Multi-Mode & Multi-Provider Launcher (`run.py`)**:
+   - Providers: `--provider gemini` (Google Gemini Live & Chat) or `--provider chatgpt` (ChatGPT Web Voice). Default: `auto` (uses Gemini if `GEMINI_API_KEY` is available).
+   - Modes: `--mode both` (default: MCP server + Live Voice Bridge), `--mode mcp`, `--mode live`.
 
 ### Quick Start (Linux & Android Termux)
 

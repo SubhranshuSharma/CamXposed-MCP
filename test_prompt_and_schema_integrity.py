@@ -496,6 +496,38 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertIn("python-numpy", install_content)
         self.assertIn("--run", install_content)
 
+    def test_gemini_live_bridge_and_subagent_integrity(self):
+        """Gemini Live Bridge and Vision Subagent must have official tool declarations, pure chat routing, and barge-in."""
+        import gemini
+
+        bridge = gemini.GeminiLiveBridge(
+            camera_ip="10.195.38.213",
+            api_key="test-api-key"
+        )
+        tools = bridge._setup_tool_declarations()
+        self.assertEqual(len(tools), 1)
+        tool_decls = tools[0].function_declarations
+        names = [d.name for d in tool_decls]
+
+        # 1. Official tool declarations for front-line voice agent
+        self.assertIn("spawn_subagent", names)
+        self.assertIn("camera_move", names)
+        self.assertIn("camera_observe", names)
+        self.assertIn("camera_speak", names)
+
+        # 2. Subagent does NOT have spawn_subagent in its tools/routing (eliminating recursion natively)
+        subagent = gemini.GeminiSubagent(client=bridge.client, camera_ip="10.195.38.213")
+        self.assertFalse(subagent.is_busy())
+        self.assertEqual(subagent.get_target(), "")
+
+        # 3. Speaker instant barge-in cut-off
+        speaker = gemini.GeminiCameraSpeaker(camera_ip="10.195.38.213")
+        speaker.is_playing = True
+        speaker.queue.extend(b"\x00" * 1000)
+        speaker.stop_playback(reason="test_barge_in")
+        self.assertFalse(speaker.is_playing)
+        self.assertEqual(len(speaker.queue), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

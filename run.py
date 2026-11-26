@@ -43,6 +43,7 @@ REQUIRED_LIVE = {
     "numpy": "numpy",
     "aioice": "aioice",
     "onnxruntime": "onnxruntime",
+    "google.genai": "google-genai",
 }
 
 
@@ -899,7 +900,9 @@ def main() -> int:
     parser.add_argument("--account-email", default=os.getenv("CAMXPOSED_ACCOUNT_EMAIL"),
                         help="ChatGPT account email to use (prompts user to select from discovered Firefox accounts if omitted)")
     parser.add_argument("--voice", default=os.getenv("CAMXPOSED_VOICE", "cove"),
-                        help="ChatGPT voice name: cove, breeze, ember, juniper, vale (default: cove)")
+                        help="Voice name: cove/breeze/ember for ChatGPT, or Puck/Charon/Aoede for Gemini (default: cove)")
+    parser.add_argument("--provider", choices=["auto", "gemini", "chatgpt"], default=os.getenv("CAMXPOSED_PROVIDER", "auto"),
+                        help="Voice bridge provider: 'gemini' (Google Gemini Live & Chat APIs) or 'chatgpt' (ChatGPT Web Voice). Default: 'auto' (prefers gemini if GEMINI_API_KEY is available)")
     parser.add_argument("--motion-cooldown", type=float, default=float(os.getenv("CAMXPOSED_MOTION_COOLDOWN_S", "4.0")),
                         help="Cooldown in seconds after camera movement to suppress false-positive motion alarms (default: 4.0)")
     default_verbose = os.getenv("CAMXPOSED_VERBOSE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -938,9 +941,17 @@ def main() -> int:
         target_camera_ip = select_camera_via_ws_discovery()
     os.environ["CAMXPOSED_CAMERA_IP"] = target_camera_ip
 
+    provider = getattr(args, "provider", "auto").lower()
+    if provider == "auto":
+        gemini_key_file = Path(os.path.expanduser("~/.config/camxposed-mcp/gemini_api_key"))
+        if os.getenv("GEMINI_API_KEY") or gemini_key_file.is_file():
+            provider = "gemini"
+        else:
+            provider = "chatgpt"
+
     target_token = args.token
     target_account_email = args.account_email
-    if mode in ("live", "both") and not target_token:
+    if mode in ("live", "both") and provider == "chatgpt" and not target_token:
         try:
             from live_voice_bridge import select_chatgpt_account
             chosen = select_chatgpt_account()
@@ -961,37 +972,53 @@ def main() -> int:
     server_log = None
 
     try:
-        # 1. Start Go Voice Gateway if mode is 'live' or 'both'
+        # 1. Start Voice Bridge if mode is 'live' or 'both'
         if mode in ("live", "both"):
-            gateway_proc, gateway_log = start_voice_gateway()
+            if provider == "gemini":
+                say("\n--- Starting Google Gemini Live Voice Bridge ---")
+                say(f"Target Camera IP: {target_camera_ip}")
+                say(f"Live Model:       {os.getenv('GEMINI_LIVE_MODEL', 'gemini-3.8-live')}")
+                say(f"Vision Subagent:  {os.getenv('GEMINI_CHAT_MODEL', 'gemini-2.5-flash')}")
+                say("Direct connection: Camera RTSP Mic -> Gemini Live WebSocket -> Camera TCP 28772 Speaker")
+                bridge_log_path = LOG_DIR / "gemini_bridge.log"
+                bridge_log = open(bridge_log_path, "a", encoding="utf-8")
+                bridge_cmd = [
+                    sys.executable, str(ROOT / "gemini.py"),
+                    "--camera-ip", target_camera_ip,
+                ]
+                if args.voice and args.voice != "cove":
+                    bridge_cmd.extend(["--voice", args.voice])
+                env = python_env()
+                bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT, env=env, stdout=bridge_log, stderr=subprocess.STDOUT,
+                                               start_new_session=True, preexec_fn=child_parent_death_signal())
+                say(f"✓ Gemini Live Voice Bridge running (logs: {bridge_log_path})")
+            else:
+                gateway_proc, gateway_log = start_voice_gateway()
+                say("\n--- Starting ChatGPT Live Voice Bridge ---")
+                say(f"Target Camera IP: {target_camera_ip}")
+                say(f"ChatGPT Voice:    {args.voice}")
+                if target_account_email:
+                    say(f"ChatGPT Account:  {target_account_email}")
+                say("Direct connection: Camera RTSP Mic -> ChatGPT WebRTC -> Camera TCP 28772 Speaker")
+                
+                bridge_log_path = LOG_DIR / "bridge.log"
+                bridge_log = open(bridge_log_path, "a", encoding="utf-8")
+                bridge_cmd = [
+                    sys.executable, str(ROOT / "live_voice_bridge.py"),
+                    "--camera-ip", target_camera_ip,
+                    "--voice", args.voice,
+                ]
+                if target_token:
+                    bridge_cmd.extend(["--token", target_token])
+                if target_account_email:
+                    bridge_cmd.extend(["--account-email", target_account_email])
+                if args.motion_cooldown is not None:
+                    bridge_cmd.extend(["--motion-cooldown", str(args.motion_cooldown)])
 
-        # 2. Start Live Voice Bridge if mode is 'live' or 'both'
-        if mode in ("live", "both"):
-            say("\n--- Starting ChatGPT Live Voice Bridge ---")
-            say(f"Target Camera IP: {target_camera_ip}")
-            say(f"ChatGPT Voice:    {args.voice}")
-            if target_account_email:
-                say(f"ChatGPT Account:  {target_account_email}")
-            say("Direct connection: Camera RTSP Mic -> ChatGPT WebRTC -> Camera TCP 28772 Speaker")
-            
-            bridge_log_path = LOG_DIR / "bridge.log"
-            bridge_log = open(bridge_log_path, "a", encoding="utf-8")
-            bridge_cmd = [
-                sys.executable, str(ROOT / "live_voice_bridge.py"),
-                "--camera-ip", target_camera_ip,
-                "--voice", args.voice,
-            ]
-            if target_token:
-                bridge_cmd.extend(["--token", target_token])
-            if target_account_email:
-                bridge_cmd.extend(["--account-email", target_account_email])
-            if args.motion_cooldown is not None:
-                bridge_cmd.extend(["--motion-cooldown", str(args.motion_cooldown)])
-
-            env = python_env()
-            bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT, env=env, stdout=bridge_log, stderr=subprocess.STDOUT,
-                                           start_new_session=True, preexec_fn=child_parent_death_signal())
-            say(f"✓ Live Voice Bridge process running (logs: {bridge_log_path})")
+                env = python_env()
+                bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT, env=env, stdout=bridge_log, stderr=subprocess.STDOUT,
+                                               start_new_session=True, preexec_fn=child_parent_death_signal())
+                say(f"✓ Live Voice Bridge process running (logs: {bridge_log_path})")
 
         # 2. Start MCP server and tunnel if mode is 'mcp' or 'both'
         if mode in ("mcp", "both"):

@@ -8,4 +8,5 @@ av>=12.0.0
 numpy>=1.24.0
 aioice>=0.9.0
 onnxruntime>=1.16.0
+google-genai>=1.0.0
 
