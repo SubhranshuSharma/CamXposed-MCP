@@ -64,16 +64,32 @@ def wait_for_mcp_server(timeout=10):
     return False
 
 def start_tunnel():
-    domain = STATIC_DOMAIN or "your-subdomain.ngrok-free.app"
-    print(f"Establishing ngrok tunnel to http://127.0.0.1:{PORT} on {domain}...")
+    domain = STATIC_DOMAIN
     log_f = open(TUNNEL_LOG, "w")
-    cmd = [NGROK, "http", str(PORT), f"--url=https://{domain}", "--log=stdout"]
+    cmd = [NGROK, "http", str(PORT), "--log=stdout"]
+    if domain:
+        print(f"Establishing ngrok tunnel to http://127.0.0.1:{PORT} on {domain}...")
+        cmd.append(f"--url=https://{domain}")
+    else:
+        print(f"Establishing ngrok tunnel to http://127.0.0.1:{PORT}...")
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
-    
-    tunnel_url = f"https://{domain}"
     time.sleep(2)
     if proc.poll() is not None:
         raise RuntimeError(f"ngrok exited with code {proc.poll()}")
+
+    tunnel_url = f"https://{domain}" if domain else ""
+    if not tunnel_url:
+        for _ in range(10):
+            try:
+                import json
+                with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as resp:
+                    data = json.loads(resp.read().decode())
+                    tuns = data.get("tunnels", [])
+                    if tuns:
+                        tunnel_url = tuns[0].get("public_url", "").replace("http://", "https://")
+                        break
+            except Exception:
+                time.sleep(0.5)
 
     return proc, log_f, tunnel_url
 

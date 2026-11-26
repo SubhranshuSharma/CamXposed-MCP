@@ -45,7 +45,7 @@ Optional environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `NGROK_AUTHTOKEN` | — | ngrok token for the Node SDK / Termux |
-| `CAMXPOSED_STATIC_DOMAIN` | `your-subdomain.ngrok-free.app` | Reserved ngrok domain |
+| `CAMXPOSED_STATIC_DOMAIN` | — | Optional reserved ngrok static domain |
 | `CAMXPOSED_PORT` | `8000` | Local MCP server port |
 | `CAMXPOSED_ONVIF_USER` | `admin` | Camera username |
 | `CAMXPOSED_ONVIF_PASS` | empty | Camera password |

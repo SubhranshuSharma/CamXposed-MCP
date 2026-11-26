@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 PREFERRED_PORT = int(os.getenv("CAMXPOSED_PORT", "8000"))
 PORT_SCAN_COUNT = max(1, int(os.getenv("CAMXPOSED_PORT_SCAN_COUNT", "11")))
 HOST = "127.0.0.1"
-DOMAIN = os.getenv("CAMXPOSED_STATIC_DOMAIN", "your-subdomain.ngrok-free.app").strip()
+DOMAIN = os.getenv("CAMXPOSED_STATIC_DOMAIN", "").strip()
 LOG_DIR = Path(os.getenv("CAMXPOSED_LOG_DIR", str(Path(tempfile.gettempdir()) / "camxposed-mcp")))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SERVER_LOG = LOG_DIR / "server.log"
