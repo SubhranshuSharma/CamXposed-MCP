@@ -151,7 +151,18 @@ def _format_hindi_outcome(task: str, found: bool, conclusion: str) -> tuple[str,
 
 
 def _announce_on_camera_speaker(camera_id: Optional[str], text: str):
-    """Speaks text directly through the camera's physical speaker using Edge TTS and TCP 28772."""
+    """Speaks text directly through the camera's physical speaker using Edge TTS and TCP 28772.
+    If a live voice bridge session is active, skip Edge-TTS so ChatGPT announces the outcome
+    natively without TCP port 28772 contention or acoustic mic feedback.
+    """
+    try:
+        from lan_engine import lan_engine
+        if lan_engine.is_live_session_active():
+            logger.info("[Subagent] Live voice bridge is active; delegating outcome announcement to ChatGPT live speaker.")
+            return
+    except Exception:
+        pass
+
     def _worker():
         try:
             import tempfile, subprocess, os, re, edge_tts

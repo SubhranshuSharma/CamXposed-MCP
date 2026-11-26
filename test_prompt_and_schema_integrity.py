@@ -258,6 +258,14 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         # 3. relay_message_processed handler present
         self.assertIn('relay_message_processed', src)
 
+        # 4. DataChannel keepalive present in heartbeat loop
+        self.assertIn('"type": "session.update"', src)
+
+        # 5. Subagent must check is_live_session_active to prevent speaker contention
+        import subagent_engine
+        sub_src = inspect.getsource(subagent_engine)
+        self.assertIn("is_live_session_active", sub_src)
+
     def test_vad_force_resume_and_speech_retention(self):
         """VAD detection must forcefully resume/start sessions and retain speech buffer."""
         import live_voice_bridge

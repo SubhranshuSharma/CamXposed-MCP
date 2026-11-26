@@ -1311,6 +1311,12 @@ class LiveVoiceBridge:
             logger.info("[LiveVoiceBridge] Realtime DataChannel (oai-events) closed by upstream server.")
             if self.dc is dc:
                 self.dc = None
+            if not self.disconnect_due_to_inactivity and not self.standby_mode:
+                logger.info("[LiveVoiceBridge] Unintended DataChannel close during active session -> auto-reconnecting immediately in background...")
+                if hasattr(self, "loop") and self.loop and self.loop.is_running():
+                    self.loop.call_soon_threadsafe(self.reconnect_event.set)
+                else:
+                    self.reconnect_event.set()
 
         @dc.on("error")
         def on_error(err):
@@ -1592,7 +1598,7 @@ class LiveVoiceBridge:
                 # Unexpected disconnection (DataChannel closed or network blip during active chat):
                 # Auto-reconnect immediately to resume the live session!
                 logger.info(">>> Unintended disconnect during active session — reconnecting immediately to resume conversation... <<<")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.1)
 
             is_midcall_reconnect = bool(not first_connect and not should_standby)
             first_connect = False
@@ -1613,12 +1619,21 @@ class LiveVoiceBridge:
                 self.last_agent_busy_time = now_mono
                 self.last_vad_speech_time = now_mono
 
-                # Heartbeat: keep gateway session active every 20s
+                # Heartbeat: keep gateway session active every 15s and send WebRTC DataChannel keep-alive
                 async def _heartbeat_loop():
                     while self.running and not self.reconnect_event.is_set():
-                        await asyncio.sleep(20)
+                        await asyncio.sleep(15)
                         try:
                             self.update_gateway_context()
+                        except Exception:
+                            pass
+                        try:
+                            # Send lightweight keep-alive over Realtime DataChannel so upstream OpenAI never drops the session
+                            if self.dc and getattr(self.dc, "readyState", "") == "open":
+                                self.send_dc_event({
+                                    "type": "session.update",
+                                    "session": {}
+                                })
                         except Exception:
                             pass
                 heartbeat_task = asyncio.create_task(_heartbeat_loop())
@@ -1702,8 +1717,8 @@ class LiveVoiceBridge:
                     self.cap_reached = False
                     await asyncio.sleep(60.0)
                 elif not should_standby:
-                    logger.info("Connection closed during active chat; reconnecting in 1s to continue...")
-                    await asyncio.sleep(1.0)
+                    logger.info("Connection closed during active chat; resuming live session immediately...")
+                    await asyncio.sleep(0.1)
 
     async def stop_session(self, clear_context: bool = False):
         """Stops active WebRTC session while keeping persistent VAD and alert listeners active."""
