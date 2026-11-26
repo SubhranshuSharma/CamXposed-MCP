@@ -165,16 +165,17 @@ You are an autonomous visual search subagent controlling an ONVIF PTZ camera to 
 Target entity: "{target}".
 
 CRITICAL INSTRUCTIONS:
-1. PERSISTENCE & EXHAUSTIVENESS:
-   You must be persistent, patient, and thorough. Do NOT give up early.
-   You must systematically sweep through all angles of the room (center, right, far right, left, far left, up, down).
+1. FULL SPAN COVERAGE & PERSISTENCE:
+   You must be extremely persistent, patient, and thorough. Do NOT give up early.
+   You must exhaustively sweep the entire room: covering the complete right span all the way to the far right boundary,
+   and the complete left span all the way to the far left boundary before stopping.
 2. MULTIMODAL VERIFICATION:
    Carefully examine every camera snapshot provided. Look for the target object in every corner, on surfaces,
-   floors, desks, and shelves.
+   desks, tables, shelves, chairs, and floors.
 3. CLEAR CONCLUSION:
-   - If the target is clearly visible: declare FOUND with exact spatial location (e.g., "FOUND: Keys located on the desk to the left").
-   - If not found in current frame: continue the sweep.
-   - If the entire sweep has finished without seeing the target: declare NOT FOUND.
+   - If the target is clearly visible: declare FOUND with exact spatial location (e.g., "FOUND: Keys located on the desk to the right").
+   - If not found in current frame: continue the sweep across the remaining span.
+   - ONLY after exhausting the entire left and right span without seeing the target: declare NOT FOUND.
 """
 
 
@@ -608,13 +609,26 @@ class GeminiSubagent:
         found = False
         found_details = ""
         sweep_waypoints = [
-            ("center", 0),
-            ("right", 800),
-            ("right", 800),
-            ("center", 0),
-            ("left", 800),
-            ("left", 800),
-            ("center", 0),
+            ("center", 0),          # 1. Starting center view
+            # Full Right Span (sweep all the way to right limit)
+            ("right", 1000),        # 2. Right ~45°
+            ("right", 1000),        # 3. Right ~90°
+            ("right", 1000),        # 4. Right ~135°
+            ("right", 1000),        # 5. Far right boundary (~180°)
+            # Full Left Span (sweep across through center all the way to left limit)
+            ("left", 1000),         # 6. Returning right ~135°
+            ("left", 1000),         # 7. Returning right ~90°
+            ("left", 1000),         # 8. Returning right ~45°
+            ("left", 1000),         # 9. Center view
+            ("left", 1000),         # 10. Left ~45°
+            ("left", 1000),         # 11. Left ~90°
+            ("left", 1000),         # 12. Left ~135°
+            ("left", 1000),         # 13. Far left boundary (~180°)
+            # Re-center
+            ("right", 1000),        # 14. Returning left ~135°
+            ("right", 1000),        # 15. Returning left ~90°
+            ("right", 1000),        # 16. Returning left ~45°
+            ("right", 1000),        # 17. Re-centered
         ]
 
         try:
@@ -642,11 +656,12 @@ class GeminiSubagent:
 
                 # Multimodal analysis via Gemini Chat API
                 prompt = (
-                    f"You are searching for '{target}' in this physical room using an IP camera. "
-                    f"Examine this camera snapshot very carefully. "
-                    f"Is the '{target}' visible anywhere in this frame? "
+                    f"You are searching for '{target}' in this physical room using an ONVIF PTZ camera. "
+                    f"Waypoint {idx}/{len(sweep_waypoints)} ({move_dir}). "
+                    f"Examine this camera snapshot very carefully. Inspect every surface, desk, table, floor, chair, and shelf. "
+                    f"Is '{target}' visible anywhere in this frame? "
                     f"If YES: respond with 'FOUND: [exact location, e.g. on the table / on the chair, and description]'. "
-                    f"If NO: respond with 'NOT_FOUND: [brief description of what is in frame]'. "
+                    f"If NO: respond with 'NOT_FOUND: [brief description of what is visible in frame]'. "
                     f"Do not guess or hallucinate."
                 )
 
