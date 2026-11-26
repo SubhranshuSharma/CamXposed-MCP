@@ -639,8 +639,9 @@ class GeminiSubagent:
                     f"You are an autonomous persistent visual search agent searching for '{target}' in this physical room using an ONVIF PTZ camera ({context_desc}). "
                     f"Be persistent and thorough. Examine this camera snapshot very carefully. Inspect every surface, desk, table, floor, chair, shelf, and background item. "
                     f"Is '{target}' (or any clear representation/match of it) visible anywhere in this frame? "
-                    f"If YES: respond with 'FOUND: [exact location, e.g. on the dressing table / on the shelf, and description of what you see]'. "
-                    f"If NO: respond with 'NOT_FOUND: [brief description of what is visible in frame]'. "
+                    f"Respond strictly in JSON format with two fields: "
+                    f"\"status\": either \"FOUND\" (only if target is clearly visible) or \"NOT_FOUND\" (if target is absent), "
+                    f"\"details\": \"concise description of location if found, or what is visible in frame if not found\". "
                     f"Do not guess or hallucinate."
                 )
                 try:
@@ -651,14 +652,24 @@ class GeminiSubagent:
                             prompt
                         ],
                         config=types.GenerateContentConfig(
-                            temperature=0.2,
+                            response_mime_type="application/json",
+                            temperature=0.1,
                             max_output_tokens=256
                         )
                     )
-                    text = (response.text or "").strip()
-                    logger.info(f"[Subagent] Step {step_count} ({context_desc}): {text[:90]}...")
-                    if "FOUND:" in text.upper():
-                        return True, text
+                    raw_text = (response.text or "").strip()
+                    try:
+                        parsed = json.loads(raw_text)
+                        status = str(parsed.get("status", "")).strip().upper()
+                        details = str(parsed.get("details", "")).strip()
+                    except Exception:
+                        upper_raw = raw_text.upper()
+                        status = "NOT_FOUND" if ("NOT_FOUND" in upper_raw or "NOT FOUND" in upper_raw) else ("FOUND" if "FOUND" in upper_raw else "NOT_FOUND")
+                        details = raw_text
+
+                    logger.info(f"[Subagent] Step {step_count} ({context_desc}): status={status} - {details[:90]}...")
+                    if status == "FOUND":
+                        return True, details
                 except Exception as e:
                     logger.warning(f"[Subagent] Error querying Gemini vision: {e}")
                 return False, ""
