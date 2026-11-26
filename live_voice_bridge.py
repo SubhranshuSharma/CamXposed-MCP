@@ -936,6 +936,7 @@ class LiveVoiceBridge:
         gw_user = os.getenv("GATEWAY_USER", "admin")
         gw_pass = os.getenv("GATEWAY_PASSWORD", "AdminPassword2026!")
         data = json.dumps({"username": gw_user, "password": gw_pass}).encode("utf-8")
+        login_url = f"{self.gateway_url}/api/auth/login"
         req = urllib.request.Request(login_url, data=data, headers={"Content-Type": "application/json"})
         cookie_header = []
         with urllib.request.urlopen(req) as resp:
