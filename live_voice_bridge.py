@@ -1261,6 +1261,18 @@ class LiveVoiceBridge:
             except Exception as e:
                 logger.debug(f"Failed to send session.update: {e}")
 
+            # If fresh connection (not mid-call reconnect), prompt ChatGPT to speak an initial greeting through the camera
+            if not resume:
+                async def _send_initial_hello():
+                    await asyncio.sleep(1.0)
+                    try:
+                        logger.info("Triggering initial spoken greeting through camera speaker...")
+                        self.send_relay_text("I have connected to your camera audio. Please say a brief one-sentence greeting out loud through the camera speaker to confirm the link is active.")
+                    except Exception as ex:
+                        logger.debug(f"Initial greeting trigger failed: {ex}")
+
+                asyncio.create_task(_send_initial_hello())
+
         @self.dc.on("close")
         def on_close():
             logger.warning(">>> ChatGPT Realtime DataChannel (oai-events) closed! Triggering auto-reconnect... <<<")
