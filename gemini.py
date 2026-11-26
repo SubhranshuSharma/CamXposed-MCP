@@ -345,6 +345,25 @@ def capture_camera_snapshot(cam: LanCamera) -> Optional[bytes]:
     return lan_engine.capture_snapshot(cam)
 
 
+def frames_differ(img_bytes1: Optional[bytes], img_bytes2: Optional[bytes], threshold: float = 2.5) -> bool:
+    """Returns True if camera view changed after movement, False if camera hit physical mechanical endstop."""
+    if not img_bytes1 or not img_bytes2:
+        return True
+    try:
+        import io
+        from PIL import Image
+        im1 = Image.open(io.BytesIO(img_bytes1)).convert("L").resize((64, 64))
+        im2 = Image.open(io.BytesIO(img_bytes2)).convert("L").resize((64, 64))
+        arr1 = np.asarray(im1, dtype=np.float32)
+        arr2 = np.asarray(im2, dtype=np.float32)
+        diff = float(np.mean(np.abs(arr1 - arr2)))
+        logger.debug(f"[frames_differ] Frame diff: {diff:.2f} (threshold={threshold})")
+        return diff > threshold
+    except Exception as e:
+        logger.debug(f"Frame comparison error: {e}")
+        return True
+
+
 class GeminiCameraMicCapture:
     """Captures RTSP microphone audio, downsamples to 16kHz PCM mono, and runs Silero VAD."""
 
@@ -608,63 +627,23 @@ class GeminiSubagent:
     ):
         found = False
         found_details = ""
-        sweep_waypoints = [
-            ("center", 0),          # 1. Starting center view
-            # Full Right Span (sweep all the way to right limit)
-            ("right", 1000),        # 2. Right ~45°
-            ("right", 1000),        # 3. Right ~90°
-            ("right", 1000),        # 4. Right ~135°
-            ("right", 1000),        # 5. Far right boundary (~180°)
-            # Full Left Span (sweep across through center all the way to left limit)
-            ("left", 1000),         # 6. Returning right ~135°
-            ("left", 1000),         # 7. Returning right ~90°
-            ("left", 1000),         # 8. Returning right ~45°
-            ("left", 1000),         # 9. Center view
-            ("left", 1000),         # 10. Left ~45°
-            ("left", 1000),         # 11. Left ~90°
-            ("left", 1000),         # 12. Left ~135°
-            ("left", 1000),         # 13. Far left boundary (~180°)
-            # Re-center
-            ("right", 1000),        # 14. Returning left ~135°
-            ("right", 1000),        # 15. Returning left ~90°
-            ("right", 1000),        # 16. Returning left ~45°
-            ("right", 1000),        # 17. Re-centered
-        ]
+        step_count = 0
 
         try:
             lan_engine.record_agent_working(True, "gemini_subagent")
-            logger.info(f"[Subagent] Commencing room sweep for target '{target}' ({len(sweep_waypoints)} waypoints)...")
+            logger.info(f"[Subagent] Starting dynamic span search for target '{target}'...")
 
-            for idx, (move_dir, move_ms) in enumerate(sweep_waypoints, 1):
-                if move_ms > 0:
-                    logger.info(f"[Subagent] Step {idx}/{len(sweep_waypoints)}: Moving {move_dir} ({move_ms}ms)...")
-                    move_camera(
-                        self.cam,
-                        direction=move_dir,
-                        duration_ms=move_ms,
-                        speed=8
-                    )
-                    time.sleep(1.2)  # Settle after movement
-                else:
-                    time.sleep(0.5)
-
-                # Capture real snapshot from camera
-                snapshot_bytes = capture_camera_snapshot(self.cam)
-                if not snapshot_bytes:
-                    logger.warning(f"[Subagent] Failed to capture snapshot at waypoint {idx}; continuing")
-                    continue
-
-                # Multimodal analysis via Gemini Chat API
+            def check_frame_for_target(snapshot_bytes: bytes, context_desc: str) -> tuple[bool, str]:
+                nonlocal step_count
+                step_count += 1
                 prompt = (
-                    f"You are searching for '{target}' in this physical room using an ONVIF PTZ camera. "
-                    f"Waypoint {idx}/{len(sweep_waypoints)} ({move_dir}). "
+                    f"You are searching for '{target}' in this physical room using an ONVIF PTZ camera ({context_desc}). "
                     f"Examine this camera snapshot very carefully. Inspect every surface, desk, table, floor, chair, and shelf. "
                     f"Is '{target}' visible anywhere in this frame? "
                     f"If YES: respond with 'FOUND: [exact location, e.g. on the table / on the chair, and description]'. "
                     f"If NO: respond with 'NOT_FOUND: [brief description of what is visible in frame]'. "
                     f"Do not guess or hallucinate."
                 )
-
                 try:
                     response = self.client.models.generate_content(
                         model=self.model_name,
@@ -678,24 +657,89 @@ class GeminiSubagent:
                         )
                     )
                     text = (response.text or "").strip()
-                    logger.info(f"[Subagent] Waypoint {idx} analysis: {text[:100]}...")
-
+                    logger.info(f"[Subagent] Step {step_count} ({context_desc}): {text[:90]}...")
                     if "FOUND:" in text.upper():
-                        found = True
-                        found_details = text
-                        logger.info(f"[Subagent] TARGET ACQUIRED! {found_details}")
-                        break
-
+                        return True, text
                 except Exception as e:
                     logger.warning(f"[Subagent] Error querying Gemini vision: {e}")
+                return False, ""
+
+            # 1. Check initial starting view
+            initial_snap = capture_camera_snapshot(self.cam)
+            if initial_snap:
+                is_hit, details = check_frame_for_target(initial_snap, "initial view")
+                if is_hit:
+                    found = True
+                    found_details = details
+                    logger.info(f"[Subagent] TARGET ACQUIRED immediately! {found_details}")
+
+            # 2. Go in Direction 1 (right) until further moves don't change the view
+            if not found:
+                logger.info("[Subagent] Panning RIGHT until view stops changing (physical limit)...")
+                prev_snap = initial_snap
+                right_steps = 0
+                max_right_steps = 25
+
+                while self._is_busy and right_steps < max_right_steps:
+                    right_steps += 1
+                    logger.info(f"[Subagent] Moving right (1000ms, step {right_steps})...")
+                    move_camera(self.cam, direction="right", duration_ms=1000, speed=8)
+                    time.sleep(1.2)
+
+                    curr_snap = capture_camera_snapshot(self.cam)
+                    if not curr_snap:
+                        continue
+
+                    # If further moves in this direction do not change view, physical limit reached
+                    if prev_snap and not frames_differ(prev_snap, curr_snap):
+                        logger.info(f"[Subagent] Right limit reached (view stopped changing after {right_steps} moves). Reversing to left span.")
+                        break
+
+                    prev_snap = curr_snap
+                    is_hit, details = check_frame_for_target(curr_snap, f"panning right step {right_steps}")
+                    if is_hit:
+                        found = True
+                        found_details = details
+                        logger.info(f"[Subagent] TARGET ACQUIRED while panning right! {found_details}")
+                        break
+
+            # 3. Reverse direction and go in opposite direction (left) until further moves don't change view
+            if not found:
+                logger.info("[Subagent] Reversing direction: panning LEFT across entire span until view stops changing...")
+                prev_snap = capture_camera_snapshot(self.cam)
+                left_steps = 0
+                max_left_steps = 45
+
+                while self._is_busy and left_steps < max_left_steps:
+                    left_steps += 1
+                    logger.info(f"[Subagent] Moving left (1000ms, step {left_steps})...")
+                    move_camera(self.cam, direction="left", duration_ms=1000, speed=8)
+                    time.sleep(1.2)
+
+                    curr_snap = capture_camera_snapshot(self.cam)
+                    if not curr_snap:
+                        continue
+
+                    # If further moves in this direction do not change view, opposite limit reached
+                    if prev_snap and not frames_differ(prev_snap, curr_snap):
+                        logger.info(f"[Subagent] Left limit reached (view stopped changing after {left_steps} moves). Entire physical span exhausted.")
+                        break
+
+                    prev_snap = curr_snap
+                    is_hit, details = check_frame_for_target(curr_snap, f"panning left step {left_steps}")
+                    if is_hit:
+                        found = True
+                        found_details = details
+                        logger.info(f"[Subagent] TARGET ACQUIRED while panning left! {found_details}")
+                        break
 
             # Revert to clean outcome messages
             if found:
                 reverted_msg = f"FOUND: '{target}' was found in the room. Details: {found_details}"
                 spoken = f"{target} mil gayi! Room me target mil gaya hai."
             else:
-                reverted_msg = f"NOT_FOUND: '{target}' was not found after sweeping all camera angles."
-                spoken = f"Pure kamre me khojne par bhi {target} nahi mili."
+                reverted_msg = f"NOT_FOUND: '{target}' was not found after scanning the entire physical span from end to end."
+                spoken = f"Pure kamre me dono taraf dekhne par bhi {target} nahi mili."
 
         except Exception as e:
             logger.error(f"[Subagent] Fatal error during search sweep: {e}")
