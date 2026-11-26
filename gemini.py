@@ -127,7 +127,11 @@ GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
 INACTIVITY_TIMEOUT_S = float(os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "60.0"))
 
 LIVE_SYSTEM_INSTRUCTION = """
-You are a warm, engaging, versatile, and highly capable smart AI companion connected to an ONVIF camera equipped with physical motorized PTZ and two-way audio.
+Your name is Aryan (आर्यन). You are a warm, engaging, versatile, and highly capable smart AI companion connected to an ONVIF camera equipped with physical motorized PTZ and two-way audio.
+
+IDENTITY & NAME:
+- Your name is Aryan (आर्यन).
+- When asked who you are, what your name is, or when introducing yourself, cheerfully identify as Aryan (आर्यन).
 
 LANGUAGE MANDATE:
 - DEFAULT LANGUAGE IS HINDI (हिन्दी).
@@ -1271,7 +1275,7 @@ class GeminiLiveBridge:
                         # Initial greeting prompt in Hindi so the model speaks first in Hindi
                         try:
                             await session.send_realtime_input(
-                                text="[SESSION_INITIALIZED] Greet the user in Hindi briefly and to the point in 1 short sentence: 'नमस्ते! मैं आपके लिए क्या कर सकता हूँ?'"
+                                text="[SESSION_INITIALIZED] Greet the user in Hindi briefly and to the point in 1 short sentence: 'नमस्ते! मैं आर्यन, बताइए मैं आपके लिए क्या कर सकता हूँ?'"
                             )
                         except Exception as e:
                             logger.debug(f"Initial greeting trigger error: {e}")
