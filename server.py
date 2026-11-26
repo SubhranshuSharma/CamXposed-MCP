@@ -1612,6 +1612,7 @@ def camera_move(
     duration_ms = max(100, min(duration_int, 4000))
 
     with track_agent_tool(f"camera_move:{direction}"):
+        subagent_manager.record_camera_move()
         g, cid = client.resolve_camera(camera_id)
         try: client.connect(g, cid)
         except Exception: pass
@@ -1715,6 +1716,7 @@ def camera_ptz(
         return camera_move(camera_id, direction, speed, duration_ms, wait, return_image, image_width)
     if op == "relative_move":
         with track_agent_tool("camera_ptz:relative_move"):
+            subagent_manager.record_camera_move()
             g, cid = client.resolve_camera(camera_id)
             # Serialize the relative move and its follow-up frame as one operation.
             with client.camera_operation_lock(cid):

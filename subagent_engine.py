@@ -168,6 +168,38 @@ class SubagentExecutionManager:
         self.subagent_thread: Optional[threading.Thread] = None
         self.last_spawn_time = 0.0
         self.recent_spawn_history: list[float] = []
+        self.has_denied_spawn: bool = False
+        self.camera_moves_after_denial: int = 0
+
+    def record_denial(self, reason: str = ""):
+        """Records that a spawn_subagent call was denied."""
+        with self.lock:
+            self.has_denied_spawn = True
+            self.camera_moves_after_denial = 0
+            logger.info(
+                f"[SubagentManager] Recorded spawn_subagent denial (reason='{reason}'). "
+                f"Waiting for camera_move to verify recursion chain is broken."
+            )
+
+    def record_camera_move(self):
+        """Notified whenever camera_move (or camera_ptz move) is executed.
+
+        If a spawn_subagent call was previously denied, observing camera_move confirms
+        that the subagent got rejected and is now definitely calling camera_move itself.
+        Once both conditions are met (denied once + camera_move called >= 1), we break the
+        recursion chain and immediately re-enable spawn_subagent by clearing the debounce timer.
+        """
+        with self.lock:
+            if self.has_denied_spawn:
+                self.camera_moves_after_denial += 1
+                logger.info(
+                    f"[SubagentManager] camera_move observed after denial (count={self.camera_moves_after_denial}). "
+                    f"Misaligned subagent was rejected once and is now calling camera_move itself. "
+                    f"Recursion chain broken! Re-enabling spawn_subagent immediately."
+                )
+                self.has_denied_spawn = False
+                self.camera_moves_after_denial = 0
+                self.last_spawn_time = 0.0
 
     def is_busy(self) -> bool:
         with self.lock:
@@ -262,6 +294,7 @@ class SubagentExecutionManager:
 
         # Prevent recursive nesting loops where the text subagent worker spawns another subagent
         if is_nested_subagent:
+            self.record_denial("canary_or_nested_identity")
             logger.warning(
                 f"[spawn_subagent] Subagent identified via canary/identity (canary={is_subagent_by_canary}, "
                 f"ident='{ident_clean}'). Denying spawn_subagent and providing direct camera access."
@@ -288,6 +321,7 @@ class SubagentExecutionManager:
             now = time.time()
             time_since_last_spawn = now - self.last_spawn_time
             if self.last_spawn_time > 0 and time_since_last_spawn < 25.0:
+                self.record_denial("rapid_spawn_cooldown_timer")
                 logger.warning(
                     f"[spawn_subagent] RECURSION BLOCKED (rapid back-to-back spawn: {time_since_last_spawn:.1f}s ago). "
                     f"Providing frame fallback for task: '{cleaned_task}'"
@@ -302,6 +336,7 @@ class SubagentExecutionManager:
                 }
 
             if self.active_subagent_running:
+                self.record_denial("active_subagent_running")
                 elapsed = int(now - self.active_task_start_time)
                 return {
                     "ok": False,
