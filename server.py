@@ -1751,7 +1751,7 @@ def camera_ptz(
 @mcp.tool()
 def spawn_subagent(
     search_entity_description: str,
-    previous_instructions: str = "",
+    previous_instructions: str,
     caller_identity: str = "live",
     camera_id: Optional[str] = None,
 ):
