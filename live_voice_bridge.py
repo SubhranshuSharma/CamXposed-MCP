@@ -1559,20 +1559,11 @@ class LiveVoiceBridge:
                                     conclusion = ev.get("conclusion", "")
                                     duration = ev.get("duration_seconds", "?")
                                     
-                                    if status_tag == "POSSIBLE":
-                                        found_str = "POSSIBLE TARGET LOCATED"
-                                    elif found is True or status_tag == "FOUND":
-                                        found_str = "FOUND"
-                                    else:
-                                        found_str = "NOT FOUND"
-
-                                    clean_details = _clean_subagent_conclusion(conclusion)
-                                    detail_str = f" {clean_details}." if clean_details else ""
-                                    notice = (
-                                        f"[Search Result: {found_str} - '{task_title}'.{detail_str} "
-                                        f"Camera is stopped at target. Announce outcome to user concisely in 1-2 spoken sentences.]"
-                                    )
-                                    logger.info(f"[LiveVoiceBridge] Subagent search completed (status={status_tag})! Relaying concise outcome to ChatGPT live session...")
+                                    notice = ev.get("reverted_message")
+                                    if not notice:
+                                        from subagent_engine import _format_hindi_outcome
+                                        notice, _ = _format_hindi_outcome(task_title, bool(found), conclusion)
+                                    logger.info(f"[LiveVoiceBridge] Subagent search completed (status={status_tag})! Relaying concise Hindi outcome to ChatGPT live session...")
                                     self.send_relay_text(notice)
                         except Exception:
                             pass

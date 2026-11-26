@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -78,6 +79,75 @@ def _clean_subagent_conclusion(text: str) -> str:
     if len(cleaned) > 220:
         cleaned = cleaned[:217] + "..."
     return cleaned
+
+
+def _format_hindi_outcome(task: str, found: bool, conclusion: str) -> tuple[str, str]:
+    """Generates clean Hindi reverted message for ChatGPT and Hindi spoken announcement for camera speaker."""
+    raw_target = task or ""
+    clean_target = re.sub(r",\s*be persistent.*$", "", raw_target, flags=re.I).strip()
+    clean_target = re.sub(
+        r"^(?:please\s+)?(?:search(?:\s+the\s+room)?(?:\s+(?:persistently|thoroughly|carefully))?\s+(?:for|to\s+find)?|find(?:\s+and\s+stop\s+at)?|look\s+for|locate)\s+",
+        "", clean_target, flags=re.I
+    )
+    clean_target = re.sub(r"^(?:a|an|the|एक|कोई)\s+", "", clean_target, flags=re.I).strip()
+    clean_target = re.sub(r"\s*(?:कमरे\s*में\s*)?(?:ढूँढें|ढूंढें|ढूँढो|ढूंढो|खोजें|खोजो|ढूँढ\s*के\s*दिखाओ|ढूंढ\s*के\s*दिखाओ).*$", "", clean_target).strip()
+    if not clean_target:
+        clean_target = "वस्तु"
+
+    clean_conclusion = _clean_subagent_conclusion(conclusion)
+    devanagari_chars = len(re.findall(r"[\u0900-\u097F]", clean_conclusion))
+    has_rich_hindi = devanagari_chars >= 20
+
+    if found:
+        if has_rich_hindi:
+            sentences = [s.strip() for s in re.split(r"[।\n.]+", clean_conclusion) if re.search(r"[\u0900-\u097F]", s)]
+            detail_hindi = "। ".join(sentences[:3])
+            if detail_hindi and not detail_hindi.endswith("।"):
+                detail_hindi += "।"
+            spoken = detail_hindi if len(detail_hindi) <= 150 else f"{clean_target} मिल गई! कैमरा उस पर केंद्रित है।"
+        else:
+            c_low = clean_conclusion.lower()
+            loc_parts = []
+            if any(w in c_low for w in ["table", "desk"]):
+                loc_parts.append("मेज पर")
+            elif "bed" in c_low:
+                loc_parts.append("बिस्तर के पास")
+            elif "shelf" in c_low or "rack" in c_low:
+                loc_parts.append("शेल्फ पर")
+            elif "floor" in c_low:
+                loc_parts.append("फर्श पर")
+            elif "cupboard" in c_low or "wardrobe" in c_low or "almirah" in c_low:
+                loc_parts.append("अलमारी के पास")
+
+            if "wall" in c_low:
+                loc_parts.append("दीवार के पास")
+            if "right" in c_low:
+                loc_parts.append("दाईं तरफ")
+            elif "left" in c_low:
+                loc_parts.append("बाईं तरफ")
+
+            loc_str = (", ".join(loc_parts)) if loc_parts else ""
+            if loc_str:
+                detail_hindi = f"{clean_target} मिल गई! स्थान: {loc_str}।"
+            else:
+                detail_hindi = f"{clean_target} मिल गई!"
+            spoken = f"{detail_hindi} कैमरा लक्ष्य पर केंद्रित है।"
+
+        reverted_msg = (
+            f"[खोज परिणाम: FOUND (मिल गया) - '{clean_target}'. {detail_hindi} "
+            f"कैमरा लक्ष्य पर केंद्रित करके रोक दिया गया है। "
+            f"उपयोगकर्ता को हिंदी में 1-2 सरल वाक्यों में बोलकर परिणाम बताएं।]"
+        )
+    else:
+        detail_hindi = f"पूरे कमरे में खोजने पर भी {clean_target} नहीं मिली।"
+        spoken = f"खोज पूरी हुई, कमरे में {clean_target} नहीं मिली।"
+        reverted_msg = (
+            f"[खोज परिणाम: NOT FOUND (नहीं मिला) - '{clean_target}'. {detail_hindi} "
+            f"कैमरा स्कैन पूरा हो चुका है। "
+            f"उपयोगकर्ता को हिंदी में 1-2 सरल वाक्यों में बोलकर बताएं कि वस्तु कमरे में नहीं मिली।]"
+        )
+
+    return reverted_msg, spoken
 
 
 def _announce_on_camera_speaker(camera_id: Optional[str], text: str):
@@ -435,6 +505,7 @@ class SubagentExecutionManager:
                 f"Search for '{task}' completed in {elapsed}s. No text reply captured."
             )
 
+            reverted_msg, spoken_hindi = _format_hindi_outcome(task, found, conclusion)
             result = {
                 "ok": True,
                 "status": "completed",
@@ -442,6 +513,8 @@ class SubagentExecutionManager:
                 "status_tag": status_tag,
                 "task": task,
                 "conclusion": conclusion,
+                "reverted_message": reverted_msg,
+                "spoken_announcement": spoken_hindi,
                 "duration_seconds": elapsed,
                 "camera_id": camera_id,
                 "chat_url": conv_url,
@@ -451,21 +524,18 @@ class SubagentExecutionManager:
 
             logger.info(f"[Subagent] Done '{task}' in {elapsed}s. found={found}. url={conv_url or 'N/A'}")
 
-            # 1. Announce outcome directly on the camera's physical speaker!
-            spoken_clean = _clean_subagent_conclusion(conclusion)
-            if not spoken_clean:
-                spoken_clean = "अलमारी मिल गई!" if ("अलमारी" in task and found) else ("लक्ष्य मिल गया!" if found else "खोज पूरी हुई, वस्तु कमरे में नहीं मिली।")
-            logger.info(f"[Subagent] Announcing search outcome directly on camera speaker: '{spoken_clean}'")
-            _announce_on_camera_speaker(camera_id, spoken_clean)
+            # 1. Announce outcome directly on the camera's physical speaker in Hindi!
+            logger.info(f"[Subagent] Announcing search outcome directly on camera speaker: '{spoken_hindi}'")
+            _announce_on_camera_speaker(camera_id, spoken_hindi)
 
             # 2. Let live_voice_bridge handle the live ChatGPT session callback with proper parent_id chaining
             # (Avoids double-posting and desyncing the conversation tree)
             # if not orig_cid:
             #     _, orig_cid, orig_pid = get_active_voice_session_ids()
             # if orig_cid:
-            #     self._post_callback_to_conversation(orig_cid, orig_pid, task, found, spoken_clean)
+            #     self._post_callback_to_conversation(orig_cid, orig_pid, task, found, spoken_hindi)
 
-            # 3. Notify live_voice_bridge via session_state.json
+            # 3. Notify live_voice_bridge via session_state.json with Hindi reverted message
             try:
                 from lan_engine import _session_state_file
                 sf = _session_state_file()
@@ -481,6 +551,8 @@ class SubagentExecutionManager:
                     "duration_seconds": elapsed,
                     "found": found,
                     "conclusion": conclusion,
+                    "reverted_message": reverted_msg,
+                    "spoken_announcement": spoken_hindi,
                 }
                 tmp = sf.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
                 tmp.write_text(json.dumps(state), encoding="utf-8")
@@ -528,12 +600,8 @@ class SubagentExecutionManager:
                     logger.warning("[Subagent] Sentinel token generation failed for callback.")
                     return
 
-                status_str = "FOUND" if found else "NOT FOUND"
-                detail_str = f" {conclusion_text}" if conclusion_text else ""
-                callback_prompt = (
-                    f"[Search Result: {status_str} - '{task}'.{detail_str} "
-                    f"Camera is stopped at target. Announce outcome to user concisely in 1-2 spoken sentences.]"
-                )
+                reverted_msg, _ = _format_hindi_outcome(task, found, conclusion_text)
+                callback_prompt = reverted_msg
 
                 payload = json.dumps({
                     "action": "next",

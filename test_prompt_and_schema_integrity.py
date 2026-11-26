@@ -208,6 +208,26 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertIsNotNone(formatted)
         self.assertIn("[MIC] User speech detected on camera microphone", formatted)
 
+    def test_hindi_reverted_outcome(self):
+        """Reverted messages and announcements for found/not found must be in Hindi."""
+        from subagent_engine import _format_hindi_outcome
+
+        # Found test
+        rev_found, spk_found = _format_hindi_outcome(
+            "एक गणेश जी की मूर्ति या प्रतिमा (Ganesh ji statue/idol) कमरे में ढूँढें, be persistent",
+            True,
+            "FOUND Ganesh ji ki murti located on the wooden table, against the wall."
+        )
+        self.assertIn("खोज परिणाम: FOUND (मिल गया)", rev_found)
+        self.assertIn("उपयोगकर्ता को हिंदी में 1-2 सरल वाक्यों में बोलकर परिणाम बताएं", rev_found)
+        self.assertIn("मिल गई!", spk_found)
+
+        # Not found test
+        rev_nf, spk_nf = _format_hindi_outcome("अलमारी", False, "Not found after sweep.")
+        self.assertIn("खोज परिणाम: NOT FOUND (नहीं मिला)", rev_nf)
+        self.assertIn("अलमारी नहीं मिली", rev_nf)
+        self.assertIn("नहीं मिली", spk_nf)
+
 
 if __name__ == "__main__":
     unittest.main()
