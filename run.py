@@ -340,11 +340,32 @@ def start_ngrok(port: int, *, change_token: bool = False):
         env["NGROK_AUTHTOKEN"] = token
         proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
                                 start_new_session=True)
-        time.sleep(1.5)
-        if proc.poll() is not None:
+        url = f"https://{DOMAIN}" if DOMAIN else ""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not url:
+            if proc.poll() is not None:
+                log.close()
+                raise RuntimeError(f"ngrok exited during startup; inspect {TUNNEL_LOG}")
+            try:
+                import json
+                req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels")
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    tunnels = data.get("tunnels", [])
+                    if tunnels:
+                        public_addr = tunnels[0].get("public_url", "")
+                        if public_addr:
+                            url = public_addr.replace("http://", "https://")
+                            break
+            except Exception:
+                time.sleep(0.5)
+
+        if not url:
             log.close()
-            raise RuntimeError(f"ngrok exited during startup; inspect {TUNNEL_LOG}")
-        return proc, log, f"https://{DOMAIN}" if DOMAIN else ""
+            stop_process(proc)
+            raise RuntimeError(f"Failed to resolve public ngrok URL from tunnel API; inspect {TUNNEL_LOG}")
+
+        return proc, log, url
 
     node, env = ensure_termux_ngrok_sdk() if is_termux() else (shutil.which("node"), os.environ.copy())
     if not node:
@@ -654,7 +675,9 @@ def main() -> int:
 
             say("Connecting ngrok remote tunnel...")
             tunnel_proc, tunnel_log, public_url = start_ngrok(port, change_token=change_token)
-            endpoint = public_url + "/mcp"
+            if not public_url:
+                raise RuntimeError("Failed to resolve public ngrok URL.")
+            endpoint = public_url.rstrip("/") + "/mcp"
             say("Checking the public MCP endpoint...")
             if verify_remote_endpoint(endpoint):
                 say("✓ Remote MCP handshake succeeded")
