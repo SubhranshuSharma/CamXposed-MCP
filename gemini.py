@@ -120,7 +120,7 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 KEY_FILE = CONFIG_DIR / "gemini_api_key"
 
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
-GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
+GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
 GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
 INACTIVITY_TIMEOUT_S = float(os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "60.0"))
 
@@ -664,24 +664,35 @@ class GeminiSubagent:
                     f"\"details\": \"concise description of location if found, or what is visible in frame if not found\". "
                     f"Do not guess or hallucinate."
                 )
-                candidate_models = [self.model_name, "gemini-3-flash-preview", "gemini-3.8-flash"]
+                candidate_models = ["gemini-3-flash-preview", self.model_name, "gemini-3.8-flash"]
                 # De-duplicate while preserving order
                 models_to_try = list(dict.fromkeys(candidate_models))
 
+                import concurrent.futures
                 for model in models_to_try:
                     try:
-                        response = self.client.models.generate_content(
-                            model=model,
-                            contents=[
-                                types.Part.from_bytes(data=snapshot_bytes, mime_type="image/jpeg"),
-                                prompt
-                            ],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                temperature=0.1,
-                                max_output_tokens=256
+                        def _do_generate():
+                            return self.client.models.generate_content(
+                                model=model,
+                                contents=[
+                                    types.Part.from_bytes(data=snapshot_bytes, mime_type="image/jpeg"),
+                                    prompt
+                                ],
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    temperature=0.1,
+                                    max_output_tokens=256
+                                )
                             )
-                        )
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(_do_generate)
+                            try:
+                                response = future.result(timeout=12.0)
+                            except concurrent.futures.TimeoutError:
+                                logger.warning(f"[Subagent] Model {model} timed out after 12s, falling back...")
+                                continue
+
                         raw_text = (response.text or "").strip()
                         try:
                             parsed = json.loads(raw_text)
@@ -698,7 +709,7 @@ class GeminiSubagent:
                         return False, details
                     except Exception as e:
                         err_str = str(e)
-                        if "503" in err_str or "404" in err_str or "UNAVAILABLE" in err_str or "NOT_FOUND" in err_str:
+                        if "503" in err_str or "404" in err_str or "UNAVAILABLE" in err_str or "NOT_FOUND" in err_str or "429" in err_str:
                             logger.warning(f"[Subagent] Model {model} unavailable ({err_str[:60]}), trying next candidate...")
                             continue
                         logger.warning(f"[Subagent] Error querying Gemini vision with {model}: {e}")
