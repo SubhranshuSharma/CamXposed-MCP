@@ -538,6 +538,48 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertFalse(speaker.is_playing)
         self.assertEqual(len(speaker.queue), 0)
 
+    def test_ptz_feature_stall_detector_exact_fidelity(self):
+        """PtzFeatureStallDetector must exactly replicate CamXposed-master dual detector invariants and fallbacks."""
+        import io
+        from PIL import Image
+        import ptz_stall_detector as psd
+        from ptz_stall_detector import PtzFeatureStallDetector
+
+        # 1. Structural constants
+        self.assertEqual(psd.W, 320)
+        self.assertEqual(psd.H, 240)
+        self.assertEqual(psd.BITS, 128)
+        self.assertEqual(psd.MAX_FEATURES, 420)
+        self.assertEqual(psd.MIN_MATCHES, 8)
+        self.assertEqual(psd.MIN_INLIER_RATIO, 0.28)
+        self.assertEqual(psd.MOVE_THRESHOLD_PX, 1.8)
+        self.assertEqual(psd.TEMPLATE_SIZE, 32)
+        self.assertEqual(psd.TEMPLATE_RADIUS, 16)
+        self.assertEqual(psd.TEMPLATE_MIN_SCORE, 0.68)
+        self.assertEqual(psd.TEMPLATE_MIN_MATCHES, 4)
+        self.assertEqual(psd.TEMPLATE_MIN_CELLS, 3)
+        self.assertEqual(psd.TEMPLATE_CONSENSUS_PX, 3.0)
+
+        # 2. BRIEF 128-bit pattern generation from seed 0x51F15E
+        self.assertEqual(len(psd.BRIEF_PAIRS), 128)
+        self.assertEqual(psd.BRIEF_PAIRS[0], (-1, -3, -2, -4))
+        self.assertEqual(psd.BRIEF_PAIRS[1], (1, -3, -4, 4))
+        self.assertEqual(psd.BRIEF_PAIRS[2], (-3, 0, -2, 1))
+
+        # 3. Blank image pair must trigger template fallback and evaluate to assumed_unchanged
+        im_blank = Image.new("RGB", (320, 240), color=(128, 128, 128))
+        buf = io.BytesIO()
+        im_blank.save(buf, format="JPEG")
+        blank_bytes = buf.getvalue()
+
+        res_blank = PtzFeatureStallDetector.compare(blank_bytes, blank_bytes)
+        self.assertTrue(res_blank.template_attempted)
+        self.assertTrue(res_blank.assumed_unchanged)
+        self.assertTrue(res_blank.reliable)
+        self.assertFalse(res_blank.view_changed)
+        self.assertIn("templateAttempted=True", res_blank.summary())
+        self.assertIn("assumedUnchanged=True", res_blank.summary())
+
 
 if __name__ == "__main__":
     unittest.main()

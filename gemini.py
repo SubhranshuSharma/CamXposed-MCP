@@ -35,6 +35,7 @@ except ImportError:
 
 from lan_engine import lan_engine, LanCamera
 from live_voice_bridge import SileroVAD
+from ptz_stall_detector import PtzFeatureStallDetector, Result as PtzStallResult, Match as PtzStallMatch
 
 class PrettyColoredFormatter(logging.Formatter):
     """Rich ANSI color formatting with badges and clean timestamps for beautiful CLI output."""
@@ -345,22 +346,20 @@ def capture_camera_snapshot(cam: LanCamera) -> Optional[bytes]:
     return lan_engine.capture_snapshot(cam)
 
 
-def frames_differ(img_bytes1: Optional[bytes], img_bytes2: Optional[bytes], threshold: float = 2.5) -> bool:
-    """Returns True if camera view changed after movement, False if camera hit physical mechanical endstop."""
+def frames_differ(img_bytes1: Optional[bytes], img_bytes2: Optional[bytes]) -> bool:
+    """Exact dual-detector feature stall tracker ported from CamXposed-master (PtzFeatureStallDetector.java).
+    Uses Harris corners + 128-bit BRIEF descriptors + RANSAC translation consensus,
+    falling back to 12-cell normalized cross-correlation on Sobel gradient magnitudes.
+    Returns True if camera view changed (displacement >= 1.8px), False if view unchanged / mechanical stall.
+    """
     if not img_bytes1 or not img_bytes2:
         return True
     try:
-        import io
-        from PIL import Image
-        im1 = Image.open(io.BytesIO(img_bytes1)).convert("L").resize((64, 64))
-        im2 = Image.open(io.BytesIO(img_bytes2)).convert("L").resize((64, 64))
-        arr1 = np.asarray(im1, dtype=np.float32)
-        arr2 = np.asarray(im2, dtype=np.float32)
-        diff = float(np.mean(np.abs(arr1 - arr2)))
-        logger.debug(f"[frames_differ] Frame diff: {diff:.2f} (threshold={threshold})")
-        return diff > threshold
+        diagnosis = PtzFeatureStallDetector.compare(img_bytes1, img_bytes2)
+        logger.debug(f"[PtzFeatureStallDetector] {diagnosis.summary()}")
+        return bool(diagnosis.view_changed)
     except Exception as e:
-        logger.debug(f"Frame comparison error: {e}")
+        logger.warning(f"[PtzFeatureStallDetector] Frame comparison error: {e}")
         return True
 
 
@@ -691,9 +690,13 @@ class GeminiSubagent:
                         continue
 
                     # If further moves in this direction do not change view, physical limit reached
-                    if prev_snap and not frames_differ(prev_snap, curr_snap):
-                        logger.info(f"[Subagent] Right limit reached (view stopped changing after {right_steps} moves). Reversing to left span.")
-                        break
+                    if prev_snap:
+                        diag = PtzFeatureStallDetector.compare(prev_snap, curr_snap)
+                        if not diag.view_changed:
+                            logger.info(f"[Subagent] Right limit reached after {right_steps} moves (view stopped changing). Stall diagnosis: {diag.summary()}. Reversing to left span.")
+                            break
+                        else:
+                            logger.debug(f"[Subagent] Right step {right_steps} shift: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
 
                     prev_snap = curr_snap
                     is_hit, details = check_frame_for_target(curr_snap, f"panning right step {right_steps}")
@@ -721,9 +724,13 @@ class GeminiSubagent:
                         continue
 
                     # If further moves in this direction do not change view, opposite limit reached
-                    if prev_snap and not frames_differ(prev_snap, curr_snap):
-                        logger.info(f"[Subagent] Left limit reached (view stopped changing after {left_steps} moves). Entire physical span exhausted.")
-                        break
+                    if prev_snap:
+                        diag = PtzFeatureStallDetector.compare(prev_snap, curr_snap)
+                        if not diag.view_changed:
+                            logger.info(f"[Subagent] Left limit reached after {left_steps} moves (view stopped changing). Stall diagnosis: {diag.summary()}. Entire physical span exhausted.")
+                            break
+                        else:
+                            logger.debug(f"[Subagent] Left step {left_steps} shift: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
 
                     prev_snap = curr_snap
                     is_hit, details = check_frame_for_target(curr_snap, f"panning left step {left_steps}")
