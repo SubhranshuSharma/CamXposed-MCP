@@ -120,12 +120,12 @@ KEY_FILE = CONFIG_DIR / "gemini_api_key"
 
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
-GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Puck")
+GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
 INACTIVITY_TIMEOUT_S = float(os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "60.0"))
 
 LIVE_SYSTEM_INSTRUCTION = """
 You are connected to a physical ONVIF IP camera in real-time with physical PTZ motors and two-way audio.
-You speak naturally, warmly, and concisely in English, Hindi, or whichever language the user addresses you in.
+You speak naturally, warmly, and concisely in Hindi (or English if the user addresses you in English). You default to natural, friendly conversational Hindi with clear pronunciation.
 
 OFFICIAL TOOL ROUTING RULES:
 1. SEARCH & EXPLORATION (MANDATORY SUBAGENT):

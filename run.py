@@ -1008,19 +1008,20 @@ def main() -> int:
         # 1. Start Voice Bridge if mode is 'live' or 'both'
         if mode in ("live", "both"):
             if provider == "gemini":
+                gemini_voice = args.voice if args.voice and args.voice != "cove" else os.getenv("GEMINI_VOICE", "Charon")
                 say("\n--- Starting Google Gemini Live Voice Bridge ---")
                 say(f"Target Camera IP: {target_camera_ip}")
                 say(f"Live Model:       {os.getenv('GEMINI_LIVE_MODEL', 'gemini-3.8-live')}")
                 say(f"Vision Subagent:  {os.getenv('GEMINI_CHAT_MODEL', 'gemini-2.5-flash')}")
+                say(f"Gemini Voice:     {gemini_voice} (Hindi)")
                 say("Direct connection: Camera RTSP Mic -> Gemini Live WebSocket -> Camera TCP 28772 Speaker")
                 bridge_log_path = LOG_DIR / "gemini_bridge.log"
                 bridge_log = open(bridge_log_path, "a", encoding="utf-8")
                 bridge_cmd = [
                     sys.executable, str(ROOT / "gemini.py"),
                     "--camera-ip", target_camera_ip,
+                    "--voice", gemini_voice,
                 ]
-                if args.voice and args.voice != "cove":
-                    bridge_cmd.extend(["--voice", args.voice])
                 env = python_env()
                 bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT, env=env, stdout=bridge_log, stderr=subprocess.STDOUT,
                                                start_new_session=True, preexec_fn=child_parent_death_signal())
