@@ -78,6 +78,35 @@ def ensure_python_dependencies() -> None:
     run_checked(command)
 
 
+
+def verify_prompt_and_schema_integrity() -> None:
+    """Regression check to guarantee canonical prompts and tool schemas remain locked."""
+    try:
+        import inspect
+        import server
+        sig = inspect.signature(server.spawn_subagent)
+        params = sig.parameters
+        if "previous_instructions" not in params or params["previous_instructions"].default != inspect.Parameter.empty:
+            raise RuntimeError("CRITICAL REGRESSION: previous_instructions in spawn_subagent must be mandatory with no default value!")
+
+        doc = server.spawn_subagent.__doc__ or ""
+        if "CRITICAL USAGE RESTRICTION" in doc:
+            raise RuntimeError("CRITICAL REGRESSION: Do not lecture the agent in spawn_subagent docstring! Revert to clean docstring.")
+
+        subagent_file = ROOT / "subagent_engine.py"
+        content = subagent_file.read_text(encoding="utf-8")
+        expected_template = (
+            "[Project Chrysanthemum] Find and stop at the first {obj_desc} you find in the room, "
+            "with target in middle of frame. use camxposed mcp and make sure to exaust the full span "
+            "of each left and right direction and return FOUND/NOT FOUND, use camera_move not spawn_subagent, be persistent"
+        )
+        if expected_template not in content:
+            raise RuntimeError("CRITICAL REGRESSION: Canonical subagent dispatch prompt template was modified in subagent_engine.py!")
+    except Exception as e:
+        say(f"! Prompt/Schema Integrity Check Error: {e}")
+        raise
+
+
 def termux_native_env() -> dict[str, str]:
     """Expose Termux's active libpython to native extensions loaded via dlopen.
 
@@ -586,6 +615,7 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, handle_sigterm)
     ensure_python_dependencies()
+    verify_prompt_and_schema_integrity()
 
     target_camera_ip = args.camera_ip
     if not target_camera_ip:

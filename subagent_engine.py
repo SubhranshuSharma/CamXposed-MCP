@@ -706,13 +706,8 @@ class SubagentExecutionManager:
             return self._post_to_chatgpt_web_fallback(task)
 
         # 2. Extract clean object description and build exact prompt:
-        prompt = (
-            f"[Project Chrysanthemum] You are the camera visual search subagent. Directly control the camera using camera_observe() and camera_move() to scan the room for: {obj_desc}. "
-            f"Sweep and exhaust the full viewing span in both left and right directions using camera_move(direction='left', speed=8, duration_ms=1000) and camera_move(direction='right', speed=8, duration_ms=1000). "
-            f"If you spot {obj_desc}, center it in the camera frame and reply with FOUND along with its position. "
-            f"If you search the full room and cannot spot it, reply with NOT FOUND. "
-            f"CRITICAL: DO NOT call spawn_subagent (you ARE the subagent; spawn_subagent is strictly disabled for you). You must execute camera_move and camera_observe yourself. Be persistent."
-        )
+        obj_desc = _extract_clean_object_description(task)
+        prompt = f"[Project Chrysanthemum] Find and stop at the first {obj_desc} you find in the room, with target in middle of frame. use camxposed mcp and make sure to exaust the full span of each left and right direction and return FOUND/NOT FOUND, use camera_move not spawn_subagent, be persistent"
 
         conversation_id = None
         final_reply = ""

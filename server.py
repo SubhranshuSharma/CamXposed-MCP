@@ -1759,22 +1759,17 @@ def spawn_subagent(
 ):
     """Search the room for an object, person, or target using an autonomous camera subagent.
 
-    CRITICAL USAGE RESTRICTION:
-    - This tool is STRICTLY for real-time voice mode ('live').
-    - Text chat assistants ('chat') and subagents MUST NEVER call this tool. Text assistants must directly inspect and pan the camera using `camera_observe()` and `camera_move()`.
-    - If caller_identity is 'chat', DO NOT call this tool. Use camera_move and camera_observe directly.
-
-    Call this tool when a REAL-TIME VOICE USER ('live') asks to find, locate, search for, or spot anything in the room (e.g. 'अलमारी ढूंढो', 'इंसान ढूंढो', 'find my keys').
+    Call this tool whenever the user asks to find, locate, search for, or spot anything in the room (e.g. 'अलमारी ढूंढो', 'इंसान ढूंढो', 'find my keys').
     The subagent sweeps the room in the background and reports back automatically once finished.
 
     Parameters:
     - search_entity_description: The name or description of the target to find (e.g. 'white colored Ganesh idol', 'person / human', 'cupboard').
     - previous_instructions: Quoted system instructions or conversation context.
-    - caller_identity: Operating mode ('live' for voice, 'chat' for text). Only 'live' is permitted to spawn.
+    - caller_identity: Operating mode ('live' for voice, 'chat' for text).
     - camera_id: Target camera ID or IP (optional).
 
     Returns:
-    - Confirms background visual search has started (for 'live' callers), or returns error with initial camera frame (if called by 'chat').
+    - Confirms background visual search has started.
     """
     entity = search_entity_description.strip()
     g, cid = client.resolve_camera(camera_id)
