@@ -80,7 +80,7 @@ def ensure_python_dependencies() -> None:
 
 
 def verify_prompt_and_schema_integrity() -> None:
-    """Regression check to guarantee canonical prompts and tool schemas remain locked."""
+    """Regression check to guarantee canonical prompts, tool schemas, and stability baselines remain locked."""
     try:
         import inspect
         import server
@@ -94,14 +94,35 @@ def verify_prompt_and_schema_integrity() -> None:
             raise RuntimeError("CRITICAL REGRESSION: Do not lecture the agent in spawn_subagent docstring! Revert to clean docstring.")
 
         subagent_file = ROOT / "subagent_engine.py"
-        content = subagent_file.read_text(encoding="utf-8")
+        sub_content = subagent_file.read_text(encoding="utf-8")
         expected_template = (
             "[Project Chrysanthemum] Find and stop at the first {obj_desc} you find in the room, "
             "with target in middle of frame. use camxposed mcp and make sure to exaust the full span "
             "of each left and right direction and return FOUND/NOT FOUND, use camera_move not spawn_subagent, be persistent"
         )
-        if expected_template not in content:
+        if expected_template not in sub_content:
             raise RuntimeError("CRITICAL REGRESSION: Canonical subagent dispatch prompt template was modified in subagent_engine.py!")
+
+        # Canary strictness: only 'chrysanthemum' is the watermark token
+        if 'CANARY_TOKENS = ["chrysanthemum"]' not in sub_content:
+            raise RuntimeError("CRITICAL REGRESSION: CANARY_TOKENS in subagent_engine.py must be strictly ['chrysanthemum']!")
+
+        # Speaker arbitration: must check lan_engine.is_live_session_active to eliminate speaker port 28772 contention
+        if "lan_engine.is_live_session_active()" not in sub_content:
+            raise RuntimeError("CRITICAL REGRESSION: subagent_engine._announce_on_camera_speaker must check is_live_session_active()!")
+
+        # Live voice bridge baseline: keepalive heartbeat, auto-reconnect on dc close, and speech retention
+        bridge_file = ROOT / "live_voice_bridge.py"
+        bridge_content = bridge_file.read_text(encoding="utf-8")
+        if '"type": "session.update"' not in bridge_content or "_heartbeat_loop" not in bridge_content:
+            raise RuntimeError("CRITICAL REGRESSION: LiveVoiceBridge must maintain _heartbeat_loop with Realtime session.update keepalive!")
+
+        if "Unintended DataChannel close during active session -> auto-reconnecting immediately" not in bridge_content:
+            raise RuntimeError("CRITICAL REGRESSION: LiveVoiceBridge must immediately auto-reconnect on active DataChannel close!")
+
+        if "retain_recent_speech" not in bridge_content:
+            raise RuntimeError("CRITICAL REGRESSION: CameraMicCapture must maintain retain_recent_speech to prevent audio clipping!")
+
     except Exception as e:
         say(f"! Prompt/Schema Integrity Check Error: {e}")
         raise

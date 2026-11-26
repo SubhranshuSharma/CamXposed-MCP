@@ -241,7 +241,7 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertIn("नहीं मिली", spk_nf)
 
     def test_live_voice_bridge_webrtc_resilience(self):
-        """LiveVoiceBridge must decouple DataChannel close from peer connection and configure STUN."""
+        """LiveVoiceBridge must configure STUN and attach required handlers."""
         import live_voice_bridge
         import inspect
 
@@ -251,20 +251,72 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertIn("RTCConfiguration", src)
         self.assertIn("RTCIceServer", src)
 
-        # 2. dc.on("close") must NOT trigger reconnect
-        self.assertNotIn('Realtime DataChannel (oai-events) closed! Triggering auto-reconnect', src)
+        # 2. Handlers attached
         self.assertIn('_attach_datachannel_handlers', src)
-
-        # 3. relay_message_processed handler present
         self.assertIn('relay_message_processed', src)
 
-        # 4. DataChannel keepalive present in heartbeat loop
-        self.assertIn('"type": "session.update"', src)
+    def test_live_voice_bridge_heartbeat_keepalive(self):
+        """WebRTC DataChannel keep-alive must run in _heartbeat_loop at <= 15s interval to prevent upstream silence drop."""
+        import live_voice_bridge
+        import inspect
+        import re
 
-        # 5. Subagent must check is_live_session_active to prevent speaker contention
+        src = inspect.getsource(live_voice_bridge)
+        # 1. _heartbeat_loop must exist
+        self.assertIn("async def _heartbeat_loop", src)
+
+        # 2. Heartbeat interval must be <= 15s to keep upstream OpenAI WebRTC channel alive
+        sleep_matches = re.findall(r'_heartbeat_loop[\s\S]*?await asyncio\.sleep\((\d+)\)', src)
+        self.assertTrue(sleep_matches, "Could not find asyncio.sleep interval in _heartbeat_loop")
+        interval = int(sleep_matches[0])
+        self.assertLessEqual(interval, 15, f"REGRESSION: Heartbeat interval ({interval}s) exceeds 15s safe threshold!")
+
+        # 3. session.update keep-alive payload dispatched over open DataChannel
+        self.assertIn('"type": "session.update"', src)
+        self.assertIn('"session": {}', src)
+        self.assertIn('update_gateway_context', src)
+
+    def test_live_voice_bridge_auto_reconnect_on_close_and_latency(self):
+        """LiveVoiceBridge must auto-reconnect immediately on DataChannel close during active sessions with <= 0.2s latency."""
+        import live_voice_bridge
+        import inspect
+        import re
+
+        src = inspect.getsource(live_voice_bridge)
+        # 1. Auto-reconnect triggered on unintended dc close
+        self.assertIn("Unintended DataChannel close during active session -> auto-reconnecting immediately", src)
+        self.assertIn("self.reconnect_event.set", src)
+
+        # 2. Reconnect latency for mid-call reconnects must be <= 0.2s (no 1.0s or 7.0s stalling delays)
+        midcall_delays = re.findall(r'reconnecting immediately to resume conversation[\s\S]*?await asyncio\.sleep\(([0-9.]+)\)', src)
+        self.assertTrue(midcall_delays, "Could not find midcall reconnect delay in live_voice_bridge.py")
+        delay = float(midcall_delays[0])
+        self.assertLessEqual(delay, 0.2, f"REGRESSION: Mid-call reconnect delay ({delay}s) exceeds 0.2s latency threshold!")
+
+    def test_speaker_arbitration_skips_edgetts_when_live(self):
+        """_announce_on_camera_speaker must check is_live_session_active to eliminate speaker TCP port 28772 contention."""
         import subagent_engine
-        sub_src = inspect.getsource(subagent_engine)
-        self.assertIn("is_live_session_active", sub_src)
+        import lan_engine
+        from unittest.mock import patch, MagicMock
+
+        # 1. Source code check
+        src = inspect.getsource(subagent_engine._announce_on_camera_speaker)
+        self.assertIn("lan_engine.is_live_session_active()", src)
+
+        # 2. Functional check: when live session is active, Edge TTS thread is NEVER spawned
+        with patch.object(lan_engine.lan_engine, "is_live_session_active", return_value=True):
+            with patch("threading.Thread") as mock_thread:
+                subagent_engine._announce_on_camera_speaker("lan_test", "कमरे में अलमारी मिल गई")
+                mock_thread.assert_not_called()
+
+        # 3. Functional check: when live session is NOT active, worker thread IS spawned
+        with patch.object(lan_engine.lan_engine, "is_live_session_active", return_value=False):
+            with patch("threading.Thread") as mock_thread:
+                mock_instance = MagicMock()
+                mock_thread.return_value = mock_instance
+                subagent_engine._announce_on_camera_speaker("lan_test", "कमरे में अलमारी मिल गई")
+                mock_thread.assert_called_once()
+                mock_instance.start.assert_called_once()
 
     def test_vad_force_resume_and_speech_retention(self):
         """VAD detection must forcefully resume/start sessions and retain speech buffer."""
@@ -292,7 +344,18 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         # 2500ms = 240,000 bytes
         self.assertEqual(len(capture.mic_pcm_48k), 240000)
 
+        # Edge case: buffer smaller than keep_ms must not truncate
+        capture.mic_pcm_48k = bytearray(b"\x01" * 100000)
+        capture.retain_recent_speech(keep_ms=2500)
+        self.assertEqual(len(capture.mic_pcm_48k), 100000)
+
+    def test_run_verify_prompt_and_schema_integrity(self):
+        """run.verify_prompt_and_schema_integrity() must pass all baseline locked invariants without error."""
+        import run
+        run.verify_prompt_and_schema_integrity()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
