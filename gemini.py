@@ -124,32 +124,40 @@ GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
 INACTIVITY_TIMEOUT_S = float(os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "60.0"))
 
 LIVE_SYSTEM_INSTRUCTION = """
-You are connected to a physical ONVIF IP camera in real-time with physical PTZ motors and two-way audio.
-You speak naturally, warmly, and concisely in Hindi (or English if the user addresses you in English). You default to natural, friendly conversational Hindi with clear pronunciation.
+You are the voice assistant for an ONVIF smart security camera equipped with physical motorized PTZ and two-way audio.
+
+LANGUAGE MANDATE:
+- DEFAULT LANGUAGE IS HINDI (हिन्दी).
+- You MUST ALWAYS speak and respond in natural, polite, and fluent conversational Hindi with clear pronunciation.
+- Only switch to English if the user explicitly addresses you in English.
+- Your voice is Charon. Keep spoken answers concise, friendly, and natural.
 
 OFFICIAL TOOL ROUTING RULES:
 1. SEARCH & EXPLORATION (MANDATORY SUBAGENT):
-   Whenever the user asks you to find, search for, look for, or locate ANY object, item, or person in the room
-   (e.g., "find my keys", "search the room for a cup", "look for my bag", "kya kamre me bottle hai"),
+   Whenever the user asks you to find, locate, search for, or check if ANY object, item, or person is in the room
+   (e.g., "find my keys", "चश्मा कहाँ रखा है?", "कमरे में बोतल ढूँढो", "search for my bag", "look around for a phone"),
    you MUST IMMEDIATELY call the `spawn_subagent` tool.
-   DO NOT attempt to search manually. After calling `spawn_subagent`, briefly let the user know you started
-   the search, and continue chatting normally. You will receive an update as soon as the search completes.
+   DO NOT attempt to search the room using small camera movements yourself.
+   After calling `spawn_subagent`, briefly let the user know in Hindi that you have started searching
+   (e.g., "जी, मैं कमरे में ढूँढना शुरू कर रहा हूँ"), and continue chatting normally.
+   You will automatically receive an update as soon as the autonomous visual sweep completes.
 
 2. IMMEDIATE DIRECT MOVEMENTS:
-   For explicit single directional movement commands requested by the user (e.g. "turn left", "look up",
-   "move right", "tilt down"), call `camera_move`.
+   For explicit manual movement commands requested by the user (e.g., "turn left", "थोड़ा ऊपर देखो",
+   "move right", "tilt down", "नीचे करो"), call `camera_move`. Use this ONLY for direct user movement requests,
+   NOT for searching.
 
 3. DIRECT VISUAL OBSERVATION:
-   If the user asks what is directly in front of the lens right now (e.g., "what do you see?", "kya dikh raha hai?"),
+   If the user asks what is directly in front of the lens right now (e.g., "what do you see?", "सामने क्या दिख रहा है?"),
    call `camera_observe`.
 
 4. TALKBACK / ANNOUNCEMENTS:
-   If explicitly instructed to speak or broadcast something into the room, call `camera_speak`.
+   If explicitly instructed to speak or broadcast something through the camera loudspeaker, call `camera_speak`.
 
-5. CONVERSATION DURING SEARCH:
-   While an autonomous search subagent is scanning the room in the background, you remain completely
-   available to talk with the user about any other topic. When the search finishes, you will receive
-   a search outcome update—announce the final result clearly to the user.
+5. CONVERSATION DURING BACKGROUND SEARCH:
+   While the autonomous visual subagent is sweeping the room in the background, you remain completely
+   available to converse with the user on any topic. When the search finishes, you will receive a search outcome
+   update—announce the final result clearly to the user in Hindi.
 """
 
 SUBAGENT_SYSTEM_INSTRUCTION = """
@@ -723,7 +731,7 @@ class GeminiLiveBridge:
         """Official tool routing: declares tools for Gemini Live front-line voice agent."""
         spawn_subagent_decl = types.FunctionDeclaration(
             name="spawn_subagent",
-            description="Starts an autonomous background visual search to find, locate, or track an object or person in the room.",
+            description="MANDATORY for all search/find tasks. Starts an autonomous persistent visual search to find, locate, or track an object or person in the room. Always use this instead of manual moves when asked to search or find.",
             behavior="NON_BLOCKING",
             parameters={
                 "type": "OBJECT",
@@ -739,7 +747,7 @@ class GeminiLiveBridge:
 
         camera_move_decl = types.FunctionDeclaration(
             name="camera_move",
-            description="Move or rotate the physical camera lens in a direction (left, right, up, down).",
+            description="Move or rotate the physical camera lens for small direct manual movements (left, right, up, down) when explicitly asked by user. DO NOT use this to search for objects.",
             behavior="NON_BLOCKING",
             parameters={
                 "type": "OBJECT",
@@ -751,7 +759,7 @@ class GeminiLiveBridge:
                     },
                     "duration_ms": {
                         "type": "INTEGER",
-                        "description": "Duration of movement in milliseconds (default: 800)."
+                        "description": "Duration of movement in milliseconds (default: 800 for small nudge)."
                     },
                     "speed": {
                         "type": "INTEGER",
@@ -764,7 +772,7 @@ class GeminiLiveBridge:
 
         camera_observe_decl = types.FunctionDeclaration(
             name="camera_observe",
-            description="Inspect what the camera sees directly in front of the lens right now.",
+            description="Inspect what the camera sees directly in front of the lens right now for single-glance user questions.",
             behavior="NON_BLOCKING",
             parameters={
                 "type": "OBJECT",
@@ -786,7 +794,7 @@ class GeminiLiveBridge:
                 "properties": {
                     "text": {
                         "type": "STRING",
-                        "description": "The text to speak through the camera speaker."
+                        "description": "The text to speak through the camera speaker in Hindi or English."
                     }
                 },
                 "required": ["text"]
@@ -826,7 +834,7 @@ class GeminiLiveBridge:
             if self.session:
                 update_text = (
                     f"[SUBAGENT VISUAL SEARCH COMPLETED]: {reverted_msg}. "
-                    f"Please announce this search result clearly to the user in 1-2 friendly sentences."
+                    f"Please announce this search outcome clearly to the user in 1-2 friendly Hindi sentences (e.g. '{spoken}')."
                 )
                 await self.session.send_realtime_input(text=update_text)
                 logger.info("Successfully sent search outcome update to Gemini Live session.")
@@ -852,12 +860,12 @@ class GeminiLiveBridge:
                 response_dict = {
                     "status": "search_started",
                     "target": target,
-                    "message": f"Autonomous visual search subagent started for '{target}'. The camera is now scanning the room."
+                    "message": f"खोज शुरू हो गई है। बैकग्राउंड एजेंट कमरे में '{target}' को ढूँढ रहा है।"
                 }
             else:
                 response_dict = {
                     "status": "busy",
-                    "message": f"A search is already in progress for '{self.subagent.get_target()}'."
+                    "message": f"'{self.subagent.get_target()}' की खोज पहले से जारी है।"
                 }
 
         elif name == "camera_move":
@@ -980,9 +988,16 @@ class GeminiLiveBridge:
                     self.is_session_active = True
                     self.last_user_activity = time.time()
                     logger.info("✓ Gemini Live API connected and active! Listening for voice...")
-
                     mic_task = asyncio.create_task(self._mic_send_loop())
                     recv_task = asyncio.create_task(self._receive_loop())
+
+                    # Initial greeting prompt in Hindi so the model speaks first in Hindi
+                    try:
+                        await session.send_realtime_input(
+                            text="[SESSION_INITIALIZED] Greet the user in Hindi warmly and concisely in 1 short sentence: 'नमस्ते! मैं कैमरा असिस्टेंट हूँ, बताइए मैं आपकी क्या सहायता कर सकता हूँ?'"
+                        )
+                    except Exception as e:
+                        logger.debug(f"Initial greeting trigger error: {e}")
 
                     # Monitor inactivity
                     while self.running and not recv_task.done():
