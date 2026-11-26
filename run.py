@@ -1012,7 +1012,7 @@ def main() -> int:
                 say("\n--- Starting Google Gemini Live Voice Bridge ---")
                 say(f"Target Camera IP: {target_camera_ip}")
                 say(f"Live Model:       {os.getenv('GEMINI_LIVE_MODEL', 'gemini-3.8-live')}")
-                say(f"Vision Subagent:  {os.getenv('GEMINI_CHAT_MODEL', 'gemini-2.5-flash')}")
+                say(f"Vision Subagent:  {os.getenv('GEMINI_CHAT_MODEL', 'gemini-3.8-flash')}")
                 say(f"Gemini Voice:     {gemini_voice} (Hindi)")
                 say("Direct connection: Camera RTSP Mic -> Gemini Live WebSocket -> Camera TCP 28772 Speaker")
                 bridge_log_path = LOG_DIR / "gemini_bridge.log"

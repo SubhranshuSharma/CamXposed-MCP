@@ -81,7 +81,7 @@ This branch adds full-duplex realtime voice communication and autonomous backgro
 
 1. **Google Gemini Live Voice Bridge & Vision Subagent (`gemini.py`)**:
    - **Gemini Live API (`gemini-3.8-live`)**: Full-duplex bidirectional streaming voice over WebSockets with official function calling.
-   - **Pure Chat Vision Subagent (`gemini-2.5-flash`)**: Autonomous visual room sweeping using native multimodal vision on physical camera snapshots.
+   - **Pure Chat Vision Subagent (`gemini-3.8-flash`)**: Autonomous visual room sweeping using native multimodal vision on physical camera snapshots.
    - **Official Tool Routing**: `spawn_subagent` is officially declared for the front-line voice agent and never exposed to the subagent, eliminating recursion naturally without canary tokens or entrapment hacks.
    - **Non-Blocking Background Concurrency**: The live conversational session remains fully active while the subagent sweeps the room. The user can chat freely while the camera moves, and the final outcome is announced conversationally upon completion.
    - **Instant Barge-In**: Silero VAD + Gemini server interruption cut off camera speaker output immediately when the user speaks.

@@ -2,7 +2,7 @@
 """CamXposed Gemini Live Voice Bridge & Autonomous Visual Subagent.
 
 Uses official Google Gemini Live API (gemini-3.8-live) for full-duplex realtime voice
-over WebSockets with official function calling, and Gemini Chat API (gemini-2.5-flash)
+over WebSockets with official function calling, and Gemini Chat API (gemini-3.8-flash)
 with native multimodal vision for autonomous persistent visual search.
 """
 from __future__ import annotations
@@ -120,7 +120,7 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 KEY_FILE = CONFIG_DIR / "gemini_api_key"
 
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
-GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
+GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
 GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
 INACTIVITY_TIMEOUT_S = float(os.getenv("CAMXPOSED_INACTIVITY_TIMEOUT_S", "60.0"))
 
@@ -576,7 +576,7 @@ class GeminiSubagent:
     """Autonomous visual search subagent powered by Gemini Chat API with native vision.
     
     Persistently sweeps camera PTZ across room angles, captures snapshots, and inspects
-    each frame using gemini-2.5-flash. DOES NOT expose spawn_subagent to eliminate recursion.
+    each frame using gemini-3.8-flash. DOES NOT expose spawn_subagent to eliminate recursion.
     """
 
     def __init__(self, client: genai.Client, camera_ip: str, model_name: str = GEMINI_CHAT_MODEL):
@@ -636,10 +636,10 @@ class GeminiSubagent:
                 nonlocal step_count
                 step_count += 1
                 prompt = (
-                    f"You are searching for '{target}' in this physical room using an ONVIF PTZ camera ({context_desc}). "
-                    f"Examine this camera snapshot very carefully. Inspect every surface, desk, table, floor, chair, and shelf. "
-                    f"Is '{target}' visible anywhere in this frame? "
-                    f"If YES: respond with 'FOUND: [exact location, e.g. on the table / on the chair, and description]'. "
+                    f"You are an autonomous persistent visual search agent searching for '{target}' in this physical room using an ONVIF PTZ camera ({context_desc}). "
+                    f"Be persistent and thorough. Examine this camera snapshot very carefully. Inspect every surface, desk, table, floor, chair, shelf, and background item. "
+                    f"Is '{target}' (or any clear representation/match of it) visible anywhere in this frame? "
+                    f"If YES: respond with 'FOUND: [exact location, e.g. on the dressing table / on the shelf, and description of what you see]'. "
                     f"If NO: respond with 'NOT_FOUND: [brief description of what is visible in frame]'. "
                     f"Do not guess or hallucinate."
                 )
@@ -672,31 +672,36 @@ class GeminiSubagent:
                     found_details = details
                     logger.info(f"[Subagent] TARGET ACQUIRED immediately! {found_details}")
 
-            # 2. Go in Direction 1 (right) until further moves don't change the view
+            # 2. Go in Direction 1 (right) until 3 consecutive stalled observations (physical limit)
             if not found:
                 logger.info("[Subagent] Panning RIGHT until view stops changing (physical limit)...")
                 prev_snap = initial_snap
                 right_steps = 0
                 max_right_steps = 25
+                right_stall_streak = 0
 
                 while self._is_busy and right_steps < max_right_steps:
                     right_steps += 1
                     logger.info(f"[Subagent] Moving right (1000ms, step {right_steps})...")
                     move_camera(self.cam, direction="right", duration_ms=1000, speed=8)
-                    time.sleep(1.2)
+                    time.sleep(1.3)
 
                     curr_snap = capture_camera_snapshot(self.cam)
                     if not curr_snap:
                         continue
 
-                    # If further moves in this direction do not change view, physical limit reached
+                    # Require 3 consecutive unchanged observations to confirm physical mechanical endstop
                     if prev_snap:
                         diag = PtzFeatureStallDetector.compare(prev_snap, curr_snap)
                         if not diag.view_changed:
-                            logger.info(f"[Subagent] Right limit reached after {right_steps} moves (view stopped changing). Stall diagnosis: {diag.summary()}. Reversing to left span.")
-                            break
+                            right_stall_streak += 1
+                            logger.info(f"[Subagent] Right stall observation streak={right_stall_streak}/3. Diag: {diag.summary()}")
+                            if right_stall_streak >= 3:
+                                logger.info(f"[Subagent] Right limit confirmed after {right_steps} moves (3 consecutive stalled observations). Reversing to left span.")
+                                break
                         else:
-                            logger.debug(f"[Subagent] Right step {right_steps} shift: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
+                            right_stall_streak = 0
+                            logger.debug(f"[Subagent] Right step {right_steps} confirmed move: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
 
                     prev_snap = curr_snap
                     is_hit, details = check_frame_for_target(curr_snap, f"panning right step {right_steps}")
@@ -706,31 +711,36 @@ class GeminiSubagent:
                         logger.info(f"[Subagent] TARGET ACQUIRED while panning right! {found_details}")
                         break
 
-            # 3. Reverse direction and go in opposite direction (left) until further moves don't change view
+            # 3. Reverse direction and go in opposite direction (left) until 3 consecutive stalled observations
             if not found:
                 logger.info("[Subagent] Reversing direction: panning LEFT across entire span until view stops changing...")
                 prev_snap = capture_camera_snapshot(self.cam)
                 left_steps = 0
                 max_left_steps = 45
+                left_stall_streak = 0
 
                 while self._is_busy and left_steps < max_left_steps:
                     left_steps += 1
                     logger.info(f"[Subagent] Moving left (1000ms, step {left_steps})...")
                     move_camera(self.cam, direction="left", duration_ms=1000, speed=8)
-                    time.sleep(1.2)
+                    time.sleep(1.3)
 
                     curr_snap = capture_camera_snapshot(self.cam)
                     if not curr_snap:
                         continue
 
-                    # If further moves in this direction do not change view, opposite limit reached
+                    # Require 3 consecutive unchanged observations to confirm physical mechanical endstop
                     if prev_snap:
                         diag = PtzFeatureStallDetector.compare(prev_snap, curr_snap)
                         if not diag.view_changed:
-                            logger.info(f"[Subagent] Left limit reached after {left_steps} moves (view stopped changing). Stall diagnosis: {diag.summary()}. Entire physical span exhausted.")
-                            break
+                            left_stall_streak += 1
+                            logger.info(f"[Subagent] Left stall observation streak={left_stall_streak}/3. Diag: {diag.summary()}")
+                            if left_stall_streak >= 3:
+                                logger.info(f"[Subagent] Left limit confirmed after {left_steps} moves (3 consecutive stalled observations). Entire physical span exhausted.")
+                                break
                         else:
-                            logger.debug(f"[Subagent] Left step {left_steps} shift: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
+                            left_stall_streak = 0
+                            logger.debug(f"[Subagent] Left step {left_steps} confirmed move: ({diag.dx:.1f}, {diag.dy:.1f})px, disp={diag.displacement:.1f}px")
 
                     prev_snap = curr_snap
                     is_hit, details = check_frame_for_target(curr_snap, f"panning left step {left_steps}")
