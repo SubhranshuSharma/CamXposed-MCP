@@ -331,11 +331,12 @@ class SubagentExecutionManager:
 
         ident_clean = str(caller_identity or "live").strip().lower()
         # Canary tokens injected into dispatched subagent prompts
-        # If the calling agent quotes either token in previous_instructions or task, it is caught as a subagent!
+        # Only 'chrysanthemum' is the unique watermark for dispatched subagents!
         prev_inst_lower = (previous_instructions or "").lower()
         task_lower = (search_entity_description or "").lower()
-        CANARY_TOKENS = ["chrysanthemum", "find and stop at the first", "visual search subagent"]
-        is_subagent_by_canary = any(tok in prev_inst_lower or tok in task_lower for tok in CANARY_TOKENS)
+        CANARY_TOKENS = ["chrysanthemum"]
+        matched_canary = next((tok for tok in CANARY_TOKENS if tok in prev_inst_lower or tok in task_lower), None)
+        is_subagent_by_canary = bool(matched_canary)
 
         task_upper = cleaned_task.upper()
         is_nested_subagent = (
@@ -353,9 +354,10 @@ class SubagentExecutionManager:
 
         # Prevent recursive nesting loops where the text subagent worker spawns another subagent
         if is_nested_subagent:
-            self.record_denial("canary_detected")
+            reason = f"canary_detected (token='{matched_canary}')" if is_subagent_by_canary else "room_search_mission_in_task"
+            self.record_denial(reason)
             logger.warning(
-                f"[spawn_subagent] Subagent identified via canary token (canary={is_subagent_by_canary}). "
+                f"[spawn_subagent] RECURSION BLOCKED: {reason}. "
                 f"Denying spawn_subagent and providing direct camera access."
             )
             return {
@@ -382,9 +384,10 @@ class SubagentExecutionManager:
             now = time.time()
             time_since_last_spawn = now - self.last_spawn_time
             if self.last_spawn_time > 0 and time_since_last_spawn < 25.0:
-                self.record_denial("rapid_spawn_cooldown_timer")
+                reason = f"rapid_spawn_cooldown ({time_since_last_spawn:.1f}s ago < 25s)"
+                self.record_denial(reason)
                 logger.warning(
-                    f"[spawn_subagent] RECURSION BLOCKED (rapid back-to-back spawn: {time_since_last_spawn:.1f}s ago). "
+                    f"[spawn_subagent] RECURSION BLOCKED: {reason}. "
                     f"Providing frame fallback for task: '{cleaned_task}'"
                 )
                 return {
@@ -403,8 +406,13 @@ class SubagentExecutionManager:
                 }
 
             if self.active_subagent_running:
-                self.record_denial("active_subagent_running")
                 elapsed = int(now - self.active_task_start_time)
+                reason = f"active_subagent_running ('{self.active_task_desc}' running for {elapsed}s)"
+                self.record_denial(reason)
+                logger.warning(
+                    f"[spawn_subagent] RECURSION BLOCKED: {reason}. "
+                    f"Waiting for active subagent to complete."
+                )
                 return {
                     "ok": False,
                     "error": "PERMISSION_DENIED",

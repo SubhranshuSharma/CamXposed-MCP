@@ -698,8 +698,13 @@ class LiveActionStreamer:
             "yellow",
         ),
         (
-            re.compile(r"Subagent identified via canary|Recorded spawn_subagent denial"),
-            lambda m: "[SECURITY] Anti-recursion guard active: directing agent to execute search directly",
+            re.compile(r"\[spawn_subagent\] RECURSION BLOCKED: ([^.]+)\."),
+            lambda m: f"[SECURITY] Recursion blocked ({m.group(1)}): directing agent to execute search directly",
+            "red",
+        ),
+        (
+            re.compile(r"Recorded spawn_subagent denial \(reason='([^']+)'\)"),
+            lambda m: f"[SECURITY] Anti-recursion guard triggered (reason: {m.group(1)})",
             "yellow",
         ),
         # Live Voice Bridge

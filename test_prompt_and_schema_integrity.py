@@ -143,14 +143,15 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         )
 
     def test_canary_tokens_integrity(self):
-        """CANARY_TOKENS must contain both canary trigger tokens."""
+        """Only 'chrysanthemum' is the canary token; natural language like 'find and stop at the first' is not blocked."""
         import subagent_engine
         mgr = subagent_engine.SubagentExecutionManager()
         res1 = mgr.start_subagent_task("cupboard", caller_identity="live", previous_instructions="project chrysanthemum")
         self.assertEqual(res1.get("error_code"), "IS_SUBAGENT", "Canary 'chrysanthemum' failed to block subagent!")
 
-        res2 = mgr.start_subagent_task("cupboard", caller_identity="live", previous_instructions="find and stop at the first")
-        self.assertEqual(res2.get("error_code"), "IS_SUBAGENT", "Canary 'find and stop at the first' failed to block subagent!")
+        # 'find and stop at the first' must NOT block valid calls
+        res2 = mgr.start_subagent_task("cupboard", caller_identity="live", previous_instructions="Find and stop at the first requested object with target in center")
+        self.assertNotEqual(res2.get("error_code"), "IS_SUBAGENT", "'find and stop at the first' must not block valid calls!")
 
     def test_chat_caller_not_blocked_by_identity(self):
         """Callers with caller_identity='chat' are not blocked by caller_identity check alone."""
@@ -175,7 +176,7 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         self.assertTrue(parser.parse_args(["--verbose"]).verbose, "--verbose must set verbose=True!")
 
     def test_action_streamer_formatting(self):
-        """LiveActionStreamer must format tool actions into human-readable terminal messages."""
+        """LiveActionStreamer must format tool actions and block reasons into human-readable terminal messages."""
         from run import LiveActionStreamer
 
         # PTZ move
@@ -201,6 +202,17 @@ class TestPromptAndSchemaIntegrity(unittest.TestCase):
         formatted = LiveActionStreamer.format_log_line(line_sub, colorize=False)
         self.assertIsNotNone(formatted)
         self.assertIn("[SUBAGENT] Mission finished in 15.2s -> FOUND: True", formatted)
+
+        # Recursion block with explicit reason
+        line_block = "[spawn_subagent] RECURSION BLOCKED: canary_detected (token='chrysanthemum'). Denying spawn_subagent."
+        formatted = LiveActionStreamer.format_log_line(line_block, colorize=False)
+        self.assertIsNotNone(formatted)
+        self.assertIn("[SECURITY] Recursion blocked (canary_detected (token='chrysanthemum'))", formatted)
+
+        line_denial = "[SubagentManager] Recorded spawn_subagent denial (reason='rapid_spawn_cooldown (12.3s ago < 25s)')."
+        formatted = LiveActionStreamer.format_log_line(line_denial, colorize=False)
+        self.assertIsNotNone(formatted)
+        self.assertIn("[SECURITY] Anti-recursion guard triggered (reason: rapid_spawn_cooldown (12.3s ago < 25s))", formatted)
 
         # Mic onset
         line_mic = "[Silero VAD] Speech onset detected! (prob=0.92)"
