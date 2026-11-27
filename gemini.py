@@ -151,19 +151,34 @@ VERSATILE COMPANION & WILLINGNESS (NEVER UNNECESSARILY DENY REQUESTS):
 - You are both a smart camera controller AND an entertaining, versatile conversational friend. Fulfill the user's wishes warmly and without hesitation.
 
 OFFICIAL TOOL ROUTING RULES:
-1. SEARCH & EXPLORATION (MANDATORY SUBAGENT):
-   Whenever the user asks you to find, locate, search for, or check if ANY object, item, or person is in the room
-   (e.g., "find my keys", "चश्मा कहाँ रखा है?", "कमरे में बोतल ढूँढो", "search for my bag", "look around for a phone"),
-   you MUST IMMEDIATELY call the `spawn_subagent` tool.
-   DO NOT attempt to search the room using small camera movements yourself.
-   After calling `spawn_subagent`, briefly let the user know in Hindi that you have started searching
-   (e.g., "जी, मैं कमरे में ढूँढना शुरू कर रहा हूँ"), and continue chatting normally.
-   You will automatically receive an update as soon as the autonomous visual sweep completes.
+1. TARGET LOCALIZATION & AUTONOMOUS SEARCH (MANDATORY SUBAGENT):
+   Whenever the user's intent requires locating, orienting towards, finding, tracking, or centering on ANY specific entity, person, or object, you MUST IMMEDIATELY call `spawn_subagent`.
+   DO NOT use blind `camera_move` when the camera needs to look at, face, or find something!
+   You must intelligently infer what physical entity to search for based on context:
+   - "Turn the camera back towards me" / "Meri taraf ghumao" / "Look back at me" / "Mujhe dekho" / "Face me":
+     The camera does not know where the user is sitting or standing in the room!
+     Intelligently infer that the target is the user/speaker:
+     Call `spawn_subagent(search_entity_description="a person / man in the room (the user talking)")`.
+   - "Look at the bed / table / laptop / door / window" / "TV ki taraf karo":
+     The camera needs to find that specific object and center it in the frame:
+     Call `spawn_subagent(search_entity_description="the bed / laptop / TV / etc.")`.
+   - "Find my keys / glasses / bottle / wallet / bag" / "चश्मा कहाँ रखा है?":
+     Classic item search:
+     Call `spawn_subagent(search_entity_description="keys / eyeglasses / bottle / etc.")`.
+   - "Is anyone in the room?" / "Check who is at the door":
+     Call `spawn_subagent(search_entity_description="a person / intruder / visitor in the room")`.
 
-2. IMMEDIATE DIRECT MOVEMENTS:
-   For explicit manual movement commands requested by the user (e.g., "turn left", "थोड़ा ऊपर देखो",
-   "move right", "tilt down", "नीचे करो"), call `camera_move`. Use this ONLY for direct user movement requests,
-   NOT for searching.
+   DO NOT attempt to search or orient the camera using manual small movements yourself.
+   The autonomous subagent will sweep across room angles, locate the entity, center it cleanly in the middle 50% of the frame, and report back.
+   After calling `spawn_subagent`, briefly let the user know in natural Hindi (e.g., "जी, मैं आपकी तरफ कैमरा घुमा रहा हूँ" or "जी, मैं कमरे में ढूँढना शुरू कर रहा हूँ"), and continue chatting normally.
+   You will automatically receive an update when the subagent finishes.
+
+2. BLIND MANUAL DIRECTIONAL NUDGES ONLY:
+   Call `camera_move` ONLY when the user explicitly commands a raw physical motor direction without referring to any subject, person, or object:
+   (e.g., "turn left", "move right a bit", "tilt down 10 degrees", "थोड़ा ऊपर देखो", "नीचे करो").
+   CRITICAL DISTINCTION:
+   - "Turn left" -> Blind motor move: call `camera_move(direction="left")`.
+   - "Turn towards me" -> Target orientation: call `spawn_subagent(search_entity_description="a person / man in the room (the user talking)")`.
 
 3. DIRECT VISUAL OBSERVATION:
    If the user asks what is directly in front of the lens right now (e.g., "what do you see?", "सामने क्या दिख रहा है?"),
@@ -1011,14 +1026,20 @@ class GeminiLiveBridge:
         """Official tool routing: declares tools for Gemini Live front-line voice agent."""
         spawn_subagent_decl = types.FunctionDeclaration(
             name="spawn_subagent",
-            description="MANDATORY for all search/find tasks. Starts an autonomous persistent visual search to find, locate, or track an object or person in the room. Always use this instead of manual moves when asked to search or find.",
+            description=(
+                "MANDATORY for all search, find, and target-directed orientation tasks. "
+                "Starts an autonomous persistent visual sweep to locate an object or person and center them in the frame. "
+                "Always call this when asked to find an item ('find keys', 'where is my bag') OR when asked to point/turn the camera at a subject "
+                "('turn back towards me', 'look at me', 'point at the laptop', 'face the door'). "
+                "Intelligently describe the physical entity to search for in search_entity_description."
+            ),
             behavior="NON_BLOCKING",
             parameters={
                 "type": "OBJECT",
                 "properties": {
                     "search_entity_description": {
                         "type": "STRING",
-                        "description": "The exact object, person, or entity to search for in the room."
+                        "description": "The exact physical object, person, or entity to locate and frame in the room (e.g. 'a person / man (the user talking)', 'keys on a table', 'laptop')."
                     }
                 },
                 "required": ["search_entity_description"]
@@ -1027,7 +1048,11 @@ class GeminiLiveBridge:
 
         camera_move_decl = types.FunctionDeclaration(
             name="camera_move",
-            description="Move or rotate the physical camera lens for small direct manual movements (left, right, up, down) when explicitly asked by user. DO NOT use this to search for objects.",
+            description=(
+                "ONLY for blind manual directional motor nudges (left, right, up, down) when the user commands a raw direction without specifying any subject or person "
+                "(e.g., 'turn left', 'tilt up slightly', 'thoda right karo'). "
+                "DO NOT use this to look at, face, or search for people or objects—use spawn_subagent instead."
+            ),
             behavior="NON_BLOCKING",
             parameters={
                 "type": "OBJECT",
